@@ -1,0 +1,8 @@
+data:
+  master_sheet_path: "MASTER_SHEET.csv"
+  test_size: 0.15
+  random_state: 42
+
+output:
+  models_dir: "models/"
+  reports_dir: "reports/"

@@ -1,0 +1,7 @@
+__pycache__/
+.pytest_cache/
+.ipynb_checkpoints/
+models/
+reports/
+Raw Data/
+MASTER_SHEET.csv
