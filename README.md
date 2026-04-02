@@ -94,6 +94,12 @@ For full bank-statement testing:
 - Put a statement CSV like `data/sample_bank_statement.csv` in `data/`
 - Run `make statement-sample` or call `src/run_statement_pipeline.py` directly
 
+For full folder processing:
+
+- Put every new bank statement file in `Raw Data/`
+- Keep the same `Bank Statement` sheet and header layout as `Raw Data/1.xlsx`
+- Run `make statement-folder`
+
 ## Where To See Output
 
 - Training metrics: `reports/part3_metrics.json`
@@ -101,6 +107,7 @@ For full bank-statement testing:
 - Batch keyword output: `reports/my_predictions.tsv`
 - Sample keyword output: `reports/sample_part3_predictions.tsv`
 - Statement pipeline workbook: `reports/sample_bank_statement_output.xlsx`
+- Combined folder workbook: `reports/all_statements_classified.xlsx`
 
 ## Samples
 
@@ -119,6 +126,18 @@ Run the full sample statement flow:
 
 ```bash
 make statement-sample
+```
+
+Run all files in `Raw Data/` at once:
+
+```bash
+make statement-folder
+```
+
+Or directly:
+
+```bash
+python src/run_statement_folder.py --input-dir "Raw Data" --models models/ --master MASTER_SHEET.csv --output reports/all_statements_classified.xlsx
 ```
 
 ## How It Works

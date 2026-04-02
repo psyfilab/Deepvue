@@ -13,6 +13,9 @@ predict-sample:
 statement-sample:
 	python src/run_statement_pipeline.py --input data/sample_bank_statement.csv --models models/ --master MASTER_SHEET.csv --output reports/sample_bank_statement_output.xlsx
 
+statement-folder:
+	python src/run_statement_folder.py --input-dir "Raw Data" --models models/ --master MASTER_SHEET.csv --output reports/all_statements_classified.xlsx
+
 test:
 	python -m pytest tests/ -v
 
