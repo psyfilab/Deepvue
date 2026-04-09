@@ -463,49 +463,162 @@ def save_salary_timeline_plots(
             plot_stem = f"{_sanitize_file_stem(stem_prefix)}_{plot_stem}"
         plot_path = output_dir / f"{plot_stem}_salary_timeline.png"
 
-        fig, ax = plt.subplots(figsize=(13, 6))
+        daily_df["Net_Savings"] = daily_df["Savings_Amount"] - daily_df["Expenditure_Amount"]
+        daily_df["Cumulative_Savings"] = daily_df["Savings_Amount"].cumsum()
+        daily_df["Cumulative_Expenditure"] = daily_df["Expenditure_Amount"].cumsum()
+        daily_df["Cumulative_Ratio"] = daily_df.apply(
+            lambda row: row["Cumulative_Savings"] / row["Cumulative_Expenditure"]
+            if row["Cumulative_Expenditure"] > 0
+            else 0.0,
+            axis=1,
+        )
+
+        fig, (ax_top, ax_bottom) = plt.subplots(
+            2,
+            1,
+            figsize=(14, 8),
+            sharex=True,
+            gridspec_kw={"height_ratios": [2.2, 1.2]},
+        )
         for _, event_row in group_events_df.sort_values("Salary_Date").iterrows():
             salary_date = event_row["Salary_Date"]
             window_end = event_row["Window_End_Date"]
             if pd.notna(salary_date) and pd.notna(window_end):
-                ax.axvspan(
+                ax_top.axvspan(
                     salary_date,
                     window_end + pd.Timedelta(days=1),
-                    color="#f6d55c",
-                    alpha=0.16,
+                    color="#ffd166",
+                    alpha=0.18,
+                    lw=0,
+                )
+                ax_bottom.axvspan(
+                    salary_date,
+                    window_end + pd.Timedelta(days=1),
+                    color="#ffd166",
+                    alpha=0.12,
+                    lw=0,
                 )
 
-        ax.bar(
+        ax_top.bar(
             daily_df["Date"],
             daily_df["Expenditure_Amount"],
-            width=0.8,
+            width=0.86,
             color="#d1495b",
-            alpha=0.78,
+            alpha=0.82,
             label="Expenditure",
         )
-        ax.bar(
+        ax_top.bar(
             daily_df["Date"],
             daily_df["Savings_Amount"],
-            width=0.5,
+            width=0.52,
             color="#2e8b57",
-            alpha=0.82,
+            alpha=0.88,
             label="Savings",
         )
-        ax.plot(
+        ax_top.plot(
             daily_df["Date"],
             daily_df["Salary_Credit"],
             color="#2b6cb0",
             marker="o",
-            linewidth=1.8,
+            linewidth=2.2,
             label="Salary credit",
         )
-        ax.set_title(f"Savings vs expenditure timeline: {stem_value}")
-        ax.set_xlabel("Date")
-        ax.set_ylabel("Amount")
-        ax.grid(axis="y", alpha=0.25)
-        ax.legend()
-        ax.xaxis.set_major_locator(mdates.AutoDateLocator())
-        ax.xaxis.set_major_formatter(mdates.DateFormatter("%d-%b"))
+
+        ax_top.fill_between(
+            daily_df["Date"],
+            0,
+            daily_df["Net_Savings"],
+            where=daily_df["Net_Savings"] >= 0,
+            color="#66c2a5",
+            alpha=0.18,
+            interpolate=True,
+            label="Positive net",
+        )
+        ax_top.fill_between(
+            daily_df["Date"],
+            0,
+            daily_df["Net_Savings"],
+            where=daily_df["Net_Savings"] < 0,
+            color="#ef476f",
+            alpha=0.14,
+            interpolate=True,
+            label="Negative net",
+        )
+
+        ax_bottom.plot(
+            daily_df["Date"],
+            daily_df["Cumulative_Savings"],
+            color="#2e8b57",
+            linewidth=2.2,
+            label="Cumulative savings",
+        )
+        ax_bottom.plot(
+            daily_df["Date"],
+            daily_df["Cumulative_Expenditure"],
+            color="#d1495b",
+            linewidth=2.2,
+            label="Cumulative expenditure",
+        )
+        ax_bottom_ratio = ax_bottom.twinx()
+        ax_bottom_ratio.plot(
+            daily_df["Date"],
+            daily_df["Cumulative_Ratio"],
+            color="#4c78a8",
+            linewidth=1.8,
+            linestyle="--",
+            label="Savings / expenditure ratio",
+        )
+
+        salary_total = float(group_events_df["Salary_Amount"].sum())
+        savings_total = float(daily_df["Savings_Amount"].sum())
+        expenditure_total = float(daily_df["Expenditure_Amount"].sum())
+        ratio_value = savings_total / expenditure_total if expenditure_total else 0.0
+
+        ax_top.set_title(f"Savings vs expenditure timeline: {stem_value}")
+        ax_top.set_ylabel("Daily amount")
+        ax_top.grid(axis="y", alpha=0.22)
+        ax_top.text(
+            0.01,
+            0.98,
+            "\n".join(
+                [
+                    f"Salary credits: {len(group_events_df)}",
+                    f"Salary total: {salary_total:,.0f}",
+                    f"Savings total: {savings_total:,.0f}",
+                    f"Expenditure total: {expenditure_total:,.0f}",
+                    f"S/E ratio: {ratio_value:.2f}",
+                ]
+            ),
+            transform=ax_top.transAxes,
+            va="top",
+            ha="left",
+            fontsize=9,
+            bbox={"facecolor": "white", "alpha": 0.82, "edgecolor": "#dddddd"},
+        )
+
+        ax_bottom.set_xlabel("Date")
+        ax_bottom.set_ylabel("Cumulative amount")
+        ax_bottom_ratio.set_ylabel("Cumulative ratio")
+        ax_bottom.grid(axis="y", alpha=0.18)
+
+        top_handles, top_labels = ax_top.get_legend_handles_labels()
+        bottom_handles, bottom_labels = ax_bottom.get_legend_handles_labels()
+        ratio_handles, ratio_labels = ax_bottom_ratio.get_legend_handles_labels()
+        ax_top.legend(top_handles[:3], top_labels[:3], loc="upper right", frameon=False)
+        ax_bottom.legend(
+            bottom_handles + ratio_handles,
+            bottom_labels + ratio_labels,
+            loc="upper left",
+            frameon=False,
+        )
+
+        for axis in (ax_top, ax_bottom):
+            axis.spines["top"].set_visible(False)
+            axis.spines["right"].set_visible(False)
+        ax_bottom_ratio.spines["top"].set_visible(False)
+
+        ax_bottom.xaxis.set_major_locator(mdates.AutoDateLocator())
+        ax_bottom.xaxis.set_major_formatter(mdates.DateFormatter("%d-%b"))
         fig.autofmt_xdate()
         fig.tight_layout()
         fig.savefig(plot_path, dpi=170)

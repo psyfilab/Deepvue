@@ -194,38 +194,16 @@ def build_unknown_keyword_review(keyword_review_df: pd.DataFrame) -> pd.DataFram
     for column_name in ("Level_1", "Level_2", "Level_3", "Level_4", "Level_5", "Level_6", "Level_7"):
         unknown_df[column_name] = ""
 
-    ordered_columns = [
-        "Key Word",
-        "Count",
-        "Source_Files",
-        "Review_Status",
-        "review_unknown_reason",
-        "decision_source",
-        "level3_source",
-        "level3_confidence",
-        "level5_source",
-        "level5_confidence",
-        "overall_confidence",
-        "Level_0",
-        "Level_1",
-        "Level_2",
-        "Level_3",
-        "Level_4",
-        "Level_5",
-        "Level_6",
-        "Level_7",
-        "Original_Level_0",
-        "Original_Level_1",
-        "Original_Level_2",
-        "Original_Level_3",
-        "Original_Level_4",
-        "Original_Level_5",
-        "Original_Level_6",
-        "Original_Level_7",
-    ]
-    existing_columns = [column for column in ordered_columns if column in unknown_df.columns]
-    remaining_columns = [column for column in unknown_df.columns if column not in existing_columns]
-    return unknown_df[existing_columns + remaining_columns].reset_index(drop=True)
+    output_df = unknown_df.rename(columns={"decision_source": "Decision_Status"})
+    return output_df[
+        [
+            "Key Word",
+            "Count",
+            "Source_Files",
+            "Review_Status",
+            "Decision_Status",
+        ]
+    ].reset_index(drop=True)
 
 
 def write_batch_output(
