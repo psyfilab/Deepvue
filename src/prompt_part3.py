@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import logging
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 import pandas as pd
@@ -420,6 +420,7 @@ MANUAL_MERCHANT_HINTS: dict[str, dict[str, str]] = {
     "wellness": {"Level_3": "merchant", "Level_5": "pharmacy", "Level_6": "wellness"},
     "wellnessforever": {"Level_3": "merchant", "Level_5": "pharmacy", "Level_6": "wellness forever"},
     "cafecreme": {"Level_3": "merchant", "Level_5": "dining", "Level_6": "cafe creme"},
+    "starbucks": {"Level_3": "merchant", "Level_5": "dining", "Level_6": "starbucks"},
 }
 
 PURPOSE_PATTERNS: list[tuple[re.Pattern[str], str]] = [
@@ -429,7 +430,7 @@ PURPOSE_PATTERNS: list[tuple[re.Pattern[str], str]] = [
     (re.compile(r"\bemi\b|loan repay|loan emi|intrest emi|interest emi", re.IGNORECASE), "loan repayment"),
     (re.compile(r"recharge|topup", re.IGNORECASE), "mobile recharge"),
     (re.compile(r"electricity|water|gas|lpg|billdesk|billpay|utility|broadband|dth", re.IGNORECASE), "utilities"),
-    (re.compile(r"pharm|medplus|1mg|pharmeasy", re.IGNORECASE), "pharmacy"),
+    (re.compile(r"pharm|medplus|1mg|pharmeasy|\bmed\b|medicals?|chemist", re.IGNORECASE), "pharmacy"),
     (re.compile(r"zomato|swiggy|food|restaurant|cafe|pizza|burger", re.IGNORECASE), "dining"),
     (re.compile(r"blinkit|zepto|grofers|grocery|instamart|mart", re.IGNORECASE), "grocery"),
     (re.compile(r"netflix|spotify|prime|monthly|subscription", re.IGNORECASE), "subscription"),
@@ -469,6 +470,8 @@ NON_ALPHA_RE = re.compile(r"[^a-z0-9\s]")
 COMPACT_RE = re.compile(r"[^a-z0-9]")
 WHITESPACE_RE = re.compile(r"\s+")
 VOWEL_RE = re.compile(r"[aeiou]")
+MERCHANT_MARKER_RE = re.compile(r"\bp2[vm]\b", re.IGNORECASE)
+P2P_MARKER_RE = re.compile(r"\bp2[ap]\b", re.IGNORECASE)
 
 
 @dataclass
@@ -482,6 +485,7 @@ class PromptArtifacts:
     merchant_aliases: dict[str, dict[str, str]]
     platform_aliases: dict[str, str]
     metadata: dict[str, Any]
+    level5_keyword_cues: dict[str, str] = field(default_factory=dict)
 
 
 def empty_result() -> dict[str, str]:
@@ -584,6 +588,37 @@ def detect_explicit_purpose(keyword: str) -> str:
     for pattern, purpose in PURPOSE_PATTERNS:
         if pattern.search(keyword):
             return purpose
+    return ""
+
+
+def detect_counterparty_marker(keyword: str) -> str:
+    """Detect explicit P2 markers that imply counterparty type."""
+
+    normalized = normalize_spaces(keyword)
+    if MERCHANT_MARKER_RE.search(normalized):
+        return "merchant"
+    if P2P_MARKER_RE.search(normalized):
+        return "p2p"
+    return ""
+
+
+def detect_level5_keyword_cue(
+    keyword: str,
+    level5_keyword_cues: dict[str, str],
+) -> str:
+    """Match a longer keyword against stored Level 5 substring cues."""
+
+    compact_keyword = compact_text(keyword)
+    if not compact_keyword:
+        return ""
+
+    for cue, label in sorted(
+        level5_keyword_cues.items(),
+        key=lambda item: len(item[0]),
+        reverse=True,
+    ):
+        if cue and cue in compact_keyword:
+            return label
     return ""
 
 
@@ -706,6 +741,11 @@ def derive_prompt_labels(
     manual_merchant = detect_manual_merchant(keyword)
     if manual_merchant:
         result.update({key: value for key, value in manual_merchant.items() if value})
+
+    if not result["Level_3"]:
+        counterparty_marker = detect_counterparty_marker(keyword)
+        if counterparty_marker:
+            result["Level_3"] = counterparty_marker
 
     if not result["Level_3"]:
         p2p_entity = detect_p2p_entity(keyword, merchant_aliases=merchant_aliases)
@@ -841,6 +881,33 @@ def build_merchant_aliases(df: pd.DataFrame) -> dict[str, dict[str, str]]:
 
     logger.info("Built %s merchant aliases", len(merchant_aliases))
     return merchant_aliases
+
+
+def build_level5_keyword_cues(df: pd.DataFrame) -> dict[str, str]:
+    """Build conservative substring cues for Level 5 classification."""
+
+    cue_votes: dict[str, dict[str, int]] = {}
+
+    for _, row in df[df["Level_5"] != ""].iterrows():
+        cue = compact_text(str(row["Key Word"]))
+        if len(cue) < 4:
+            continue
+        label = str(row["Level_5"])
+        cue_votes.setdefault(cue, {})
+        cue_votes[cue][label] = cue_votes[cue].get(label, 0) + int(row["Count"])
+
+    cues: dict[str, str] = {}
+    for cue, label_votes in cue_votes.items():
+        best_label, best_count = max(label_votes.items(), key=lambda item: item[1])
+        total = sum(label_votes.values())
+        if total <= 0:
+            continue
+        if best_count / total < 0.75:
+            continue
+        cues[cue] = best_label
+
+    logger.info("Built %s Level 5 keyword cues", len(cues))
+    return cues
 
 
 def json_key(payload: dict[str, str]) -> str:

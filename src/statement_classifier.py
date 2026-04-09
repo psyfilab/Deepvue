@@ -9,6 +9,7 @@ from collections import defaultdict
 import pandas as pd
 
 from .predict import KeywordClassifier
+from .prompt_part3 import clean_entity, detect_explicit_purpose
 
 logger = logging.getLogger(__name__)
 
@@ -17,6 +18,13 @@ SALARY_KEYWORDS = re.compile(
     r"\b(?:salary|salaryxce|payroll|payslip|labour|wages|sal)\b",
     flags=re.IGNORECASE,
 )
+SALARY_ENTITY_STOPWORDS = re.compile(
+    r"\b(?:salary|salaryxce|payroll|payslip|labour|wages|sal|credit|credited|via|by|from|for)\b",
+    flags=re.IGNORECASE,
+)
+MIN_SALARY = 10_000
+MIN_SALARY_MONTHS = 2
+SALARY_DAY_STD_MAX = 7
 SLASH_UPI_RE = re.compile(
     r"\bUPI\b(?:/\d+)?/(?:DR|CR)(?:/\d+)?/([^/\d\-][^/]{1,19})/([A-Z]{2,6})/(\S+)",
     flags=re.IGNORECASE,
@@ -47,6 +55,8 @@ GATEWAY_VPA_FRAGMENTS = frozenset(
         "pharmeasy",
     }
 )
+UPI_P2_MERCHANT_MARKERS = frozenset({"P2M", "P2V"})
+UPI_P2_P2P_MARKERS = frozenset({"P2A", "P2P"})
 BANK_CODE_TO_NAME = {
     "sbin": "state bank of india",
     "hdfc": "hdfc bank",
@@ -88,6 +98,18 @@ def _normalize_compare(value: str) -> str:
     """Normalize a label for duplicate checks."""
 
     return "" if value is None else str(value).strip().lower()
+
+
+def derive_direction_from_amounts(debit_value: object, credit_value: object) -> str:
+    """Return debit or credit from the numeric transaction columns."""
+
+    debit_num = parse_amount(debit_value)
+    credit_num = parse_amount(credit_value)
+    if debit_num > 0 and credit_num <= 0:
+        return "debit"
+    if credit_num > 0 and debit_num <= 0:
+        return "credit"
+    return ""
 
 
 def _apply_transaction_rules(result: dict[str, str]) -> dict[str, str]:
@@ -137,6 +159,54 @@ def aggregate_part_predictions(
     return _apply_transaction_rules(result)
 
 
+def apply_structured_upi_overrides(
+    part_predictions: list[tuple[str, dict[str, str]]],
+    keyword_classifier: KeywordClassifier,
+    result: dict[str, str],
+) -> dict[str, str]:
+    """Use stable UPI/P2X structure when it is present in split parts."""
+
+    if len(part_predictions) < 3:
+        return result
+
+    ordered_parts = [part_text.strip() for part_text, _ in part_predictions if part_text.strip()]
+    ordered_predictions = [prediction for part_text, prediction in part_predictions if part_text.strip()]
+    if len(ordered_parts) < 3 or ordered_parts[0].upper() != "UPI":
+        return result
+
+    marker = ordered_parts[1].upper().replace(" ", "")
+    if marker not in UPI_P2_MERCHANT_MARKERS | UPI_P2_P2P_MARKERS:
+        return result
+
+    entity_text = ordered_parts[2]
+    entity_prediction = keyword_classifier.classify(entity_text)
+    bank_name = ""
+    inherited_purpose = ""
+
+    for prediction in ordered_predictions[3:]:
+        if not bank_name and prediction.get("Level_4"):
+            bank_name = prediction["Level_4"]
+        if not inherited_purpose and prediction.get("Level_5") not in {"", "p2p transfer"}:
+            inherited_purpose = prediction["Level_5"]
+
+    result["Level_1"] = "upi"
+    if bank_name:
+        result["Level_4"] = bank_name
+
+    if marker in UPI_P2_MERCHANT_MARKERS:
+        result["Level_3"] = "merchant"
+        result["Level_6"] = clean_entity(entity_text, result["Level_4"])
+        purpose = entity_prediction.get("Level_5", "") or inherited_purpose or detect_explicit_purpose(entity_text)
+        if purpose and purpose != "p2p transfer":
+            result["Level_5"] = purpose
+    else:
+        result["Level_3"] = "p2p"
+        result["Level_6"] = clean_entity(entity_text)
+        result["Level_5"] = "p2p transfer"
+
+    return _apply_transaction_rules(result)
+
+
 def apply_raw_transaction_overrides(
     particulars: str,
     result: dict[str, str],
@@ -171,6 +241,30 @@ def apply_raw_transaction_overrides(
         result["Level_6"] = entity
 
     return _apply_transaction_rules(result)
+
+
+def apply_amount_direction_override(
+    debit_value: object,
+    credit_value: object,
+    result: dict[str, str],
+) -> dict[str, str]:
+    """Set direction from debit and credit columns when it is explicit."""
+
+    direction = derive_direction_from_amounts(debit_value, credit_value)
+    if direction:
+        result["Level_0"] = direction
+    return result
+
+
+def extract_salary_entity(text: str) -> str:
+    """Extract a likely salary source string from particulars."""
+
+    value = str(text or "")
+    value = SALARY_ENTITY_STOPWORDS.sub(" ", value)
+    value = re.sub(r"[\d/|_\-*]+", " ", value)
+    value = re.sub(r"\b(?:neft|imps|upi|rtgs|ecs|nach|bank|payment|transfer)\b", " ", value, flags=re.IGNORECASE)
+    value = re.sub(r"\s+", " ", value).strip().lower()
+    return value
 
 
 def derive_first_level_classification(row: pd.Series) -> str:
@@ -245,6 +339,13 @@ def detect_salary(df: pd.DataFrame) -> pd.DataFrame:
     output_df["SalaryConfidence"] = 0.0
 
     credit_num = output_df["Credit"].apply(parse_amount)
+    output_df["NormText"] = (
+        output_df["Particulars"].astype(str)
+        + " "
+        + output_df["First Level Classification"].astype(str)
+        + " "
+        + output_df["Second Level Classification"].astype(str)
+    ).str.lower()
 
     explicit_mask = (
         output_df.get("Level_5", pd.Series("", index=output_df.index))
@@ -253,10 +354,7 @@ def detect_salary(df: pd.DataFrame) -> pd.DataFrame:
         | output_df.get("First Level Classification", pd.Series("", index=output_df.index))
         .astype(str)
         .str.contains("salary", case=False, na=False)
-        | (
-            output_df["Particulars"].astype(str).str.contains(SALARY_KEYWORDS, na=False)
-            & (credit_num >= 10_000)
-        )
+        | (output_df["NormText"].str.contains(SALARY_KEYWORDS, na=False) & (credit_num >= MIN_SALARY))
     )
 
     output_df.loc[explicit_mask, "IsSalary"] = 1
@@ -264,7 +362,7 @@ def detect_salary(df: pd.DataFrame) -> pd.DataFrame:
 
     dates = pd.to_datetime(output_df.get("Date"), errors="coerce")
     candidates = output_df.index[
-        (~explicit_mask) & (credit_num >= 10_000) & dates.notna()
+        (~explicit_mask) & (credit_num >= MIN_SALARY) & dates.notna()
     ]
 
     if len(candidates) >= 2:
@@ -274,33 +372,57 @@ def detect_salary(df: pd.DataFrame) -> pd.DataFrame:
             clusters[int(amount_key)].append(index)
 
         for indices in clusters.values():
-            if len(indices) < 2:
+            if len(indices) < MIN_SALARY_MONTHS:
                 continue
 
             day_std = dates.loc[indices].dt.day.std(ddof=0)
-            text_hit = output_df.loc[indices, "Particulars"].astype(str).str.contains(
-                SALARY_KEYWORDS,
-                na=False,
-            ).any()
+            text_hit = output_df.loc[indices, "NormText"].str.contains(SALARY_KEYWORDS, na=False).any()
 
             score = 0.40
-            score += 0.30 if (pd.notna(day_std) and day_std <= 7) else 0.0
+            score += 0.30 if (pd.notna(day_std) and day_std <= SALARY_DAY_STD_MAX) else 0.0
             score += 0.30 if text_hit else 0.0
 
             if score >= 0.60:
                 output_df.loc[indices, "IsSalary"] = 1
                 output_df.loc[indices, "SalaryConfidence"] = round(score, 2)
 
-    output_df.loc[
-        output_df["IsSalary"].eq(1),
-        "First Level Classification",
-    ] = "Salary"
-    output_df.loc[
-        output_df["IsSalary"].eq(1) & output_df["Second Level Classification"].eq(""),
-        "Second Level Classification",
-    ] = "Salary"
+    salary_mask = output_df["IsSalary"].eq(1)
+    salary_entity = output_df["Particulars"].astype(str).map(extract_salary_entity)
+    output_df.loc[salary_mask, "Level_0"] = "credit"
+    output_df.loc[salary_mask, "Level_1"] = ""
+    output_df.loc[salary_mask, "Level_2"] = ""
+    output_df.loc[salary_mask, "Level_3"] = "institution"
+    output_df.loc[salary_mask, "Level_4"] = ""
+    output_df.loc[salary_mask, "Level_5"] = "salary"
+    output_df.loc[salary_mask, "Level_7"] = ""
+    output_df.loc[salary_mask, "Level_6"] = salary_entity.loc[salary_mask]
+    output_df.loc[salary_mask, "First Level Classification"] = "Salary"
+    output_df.loc[salary_mask, "Second Level Classification"] = ""
 
-    return output_df
+    return output_df.drop(columns=["NormText"])
+
+
+def build_salary_summary(df: pd.DataFrame) -> pd.DataFrame:
+    """Return a salary-only summary sheet."""
+
+    salary_df = df[df.get("IsSalary", 0).astype(int).eq(1)].copy()
+    if salary_df.empty:
+        return salary_df
+
+    salary_df["Month"] = pd.to_datetime(salary_df["Date"], errors="coerce").dt.to_period("M").astype(str)
+    summary_columns = [
+        "Date",
+        "Month",
+        "Particulars",
+        "Credit",
+        "SalaryConfidence",
+        "Level_5",
+        "Level_6",
+        "First Level Classification",
+        "Source_File",
+    ]
+    available_columns = [column for column in summary_columns if column in salary_df.columns]
+    return salary_df[available_columns].reset_index(drop=True)
 
 
 class BankStatementClassifier:
@@ -339,9 +461,20 @@ class BankStatementClassifier:
 
         row_level_predictions = []
         for row_index in output_df.index:
-            row_prediction = aggregate_part_predictions(grouped_predictions.get(row_index, []))
+            row_parts = grouped_predictions.get(row_index, [])
+            row_prediction = aggregate_part_predictions(row_parts)
+            row_prediction = apply_structured_upi_overrides(
+                row_parts,
+                self.keyword_classifier,
+                row_prediction,
+            )
             row_prediction = apply_raw_transaction_overrides(
                 str(output_df.loc[row_index, "Particulars"]),
+                row_prediction,
+            )
+            row_prediction = apply_amount_direction_override(
+                output_df.loc[row_index, "Debit"],
+                output_df.loc[row_index, "Credit"],
                 row_prediction,
             )
             row_level_predictions.append(row_prediction)

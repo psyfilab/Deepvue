@@ -12,11 +12,13 @@ import pandas as pd
 if __package__ in {None, ""}:
     sys.path.append(str(Path(__file__).resolve().parent.parent))
     from src.microsegment import Microsegmenter
-    from src.statement_classifier import BankStatementClassifier
+    from src.salary_timeseries import build_salary_time_series, save_salary_timeline_plots
+    from src.statement_classifier import BankStatementClassifier, build_salary_summary
     from src.statement_splitter import load_statement, split_statement
 else:
     from .microsegment import Microsegmenter
-    from .statement_classifier import BankStatementClassifier
+    from .salary_timeseries import build_salary_time_series, save_salary_timeline_plots
+    from .statement_classifier import BankStatementClassifier, build_salary_summary
     from .statement_splitter import load_statement, split_statement
 
 logger = logging.getLogger(__name__)
@@ -35,6 +37,9 @@ def write_output(
     split_df: pd.DataFrame,
     unique_df: pd.DataFrame,
     classified_df: pd.DataFrame,
+    salary_summary_df: pd.DataFrame,
+    salary_window_summary_df: pd.DataFrame,
+    salary_window_txn_df: pd.DataFrame,
 ) -> None:
     """Write pipeline outputs to Excel or CSV."""
 
@@ -42,14 +47,42 @@ def write_output(
         classified_df.to_csv(output_path, index=False)
         unique_path = output_path.with_name(f"{output_path.stem}_unique_keywords.csv")
         unique_df.to_csv(unique_path, index=False)
+        salary_path = output_path.with_name(f"{output_path.stem}_salary_summary.csv")
+        salary_summary_df.to_csv(salary_path, index=False)
+        salary_window_path = output_path.with_name(
+            f"{output_path.stem}_salary_window_summary.csv"
+        )
+        salary_window_summary_df.to_csv(salary_window_path, index=False)
+        salary_txn_path = output_path.with_name(
+            f"{output_path.stem}_salary_window_transactions.csv"
+        )
+        salary_window_txn_df.to_csv(salary_txn_path, index=False)
         return
 
     with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
         split_df.to_excel(writer, sheet_name="Split", index=False)
         unique_df.to_excel(writer, sheet_name="Unique_Keywords", index=False)
         classified_df.to_excel(writer, sheet_name="Classified", index=False)
+        salary_summary_df.to_excel(writer, sheet_name="Salary_Summary", index=False)
+        salary_window_summary_df.to_excel(
+            writer,
+            sheet_name="Salary_Window_Summary",
+            index=False,
+        )
+        salary_window_txn_df.to_excel(
+            writer,
+            sheet_name="Salary_Window_Txns",
+            index=False,
+        )
 
-        for sheet_name in ("Split", "Unique_Keywords", "Classified"):
+        for sheet_name in (
+            "Split",
+            "Unique_Keywords",
+            "Classified",
+            "Salary_Summary",
+            "Salary_Window_Summary",
+            "Salary_Window_Txns",
+        ):
             autofit_worksheet(writer.sheets[sheet_name])
 
 
@@ -76,6 +109,12 @@ def parse_args() -> argparse.Namespace:
         type=int,
         help="Zero-based header row for Excel bank statements",
     )
+    parser.add_argument(
+        "--window-days",
+        default=10,
+        type=int,
+        help="Days after each salary credit to include in spend analysis",
+    )
     return parser.parse_args()
 
 
@@ -99,9 +138,35 @@ def main() -> int:
     split_df, unique_df = split_statement(statement_df)
     classified_df = BankStatementClassifier(models_dir=args.models).classify(split_df)
     enriched_df = Microsegmenter(master_sheet_path=args.master).run(classified_df)
+    salary_summary_df = build_salary_summary(enriched_df)
+    salary_window_summary_df, salary_window_txn_df, _ = (
+        build_salary_time_series(
+            enriched_df,
+            window_days=args.window_days,
+        )
+    )
 
-    write_output(output_path, split_df, unique_df, enriched_df)
+    write_output(
+        output_path,
+        split_df,
+        unique_df,
+        enriched_df,
+        salary_summary_df,
+        salary_window_summary_df,
+        salary_window_txn_df,
+    )
+    plots_dir = output_path.with_name(f"{output_path.stem}_plots")
+    plot_paths = save_salary_timeline_plots(
+        enriched_df,
+        salary_window_summary_df,
+        plots_dir,
+        stem_prefix=output_path.stem,
+    )
     print(f"Output written to {output_path}")
+    if plot_paths:
+        print(f"Plots written to {plots_dir}")
+        for plot_path in plot_paths:
+            print(f"Plot written to {plot_path}")
     return 0
 
 

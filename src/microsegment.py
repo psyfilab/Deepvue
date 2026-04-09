@@ -36,6 +36,7 @@ L5_SEGMENT_MAP = {
 SEGMENT_PRIORITY = [
     ("IsSalaryTxn", "Salary"),
     ("exp_food", "Food"),
+    ("exp_quick_comm", "Quick Commerce"),
     ("exp_grocery", "Grocery"),
     ("exp_ecomm", "Ecommerce"),
     ("exp_entertainment", "Entertainment"),
@@ -62,6 +63,7 @@ SEGMENT_PRIORITY = [
 
 BIAS_WEIGHTS = {
     "exp_food": 2.0,
+    "exp_quick_comm": 1.5,
     "exp_micro": 2.0,
     "exp_luxury": 1.5,
     "exp_upi_velocity": 1.5,
@@ -110,6 +112,11 @@ INSURANCE_RE = re.compile(
 )
 REFUND_RE = re.compile(r"\b(refund|reversal|cashback|reversed)\b", re.IGNORECASE)
 SALARY_RE = re.compile(r"\b(salary|salaryxce|payroll|payslip|labour|wages|sal)\b", re.IGNORECASE)
+QUICK_COMM_RE = re.compile(
+    r"\b(blinkit|zepto|instamart|swiggy\s*instamart|swiggy\s*stores|bbnow|bigbasket|dunzo|"
+    r"flipkart\s*minutes|fk\s*minutes|amazon\s*fresh)\b",
+    re.IGNORECASE,
+)
 
 
 def is_meaningful_keyword(keyword: str) -> bool:
@@ -197,6 +204,21 @@ def _assign_microsegment(row: pd.Series) -> str:
     return "Other"
 
 
+def _flag_quick_comm(row: pd.Series) -> int:
+    """Return 1 for fast-delivery grocery and convenience apps."""
+
+    text = " ".join(
+        [
+            _particulars(row),
+            str(row.get("Level_6", "") or ""),
+        ]
+    ).strip()
+    return int(
+        row.get("debit_num", 0) > 0
+        and QUICK_COMM_RE.search(text) is not None
+    )
+
+
 def _compute_bias(row: pd.Series) -> float:
     """Compute a simple present-bias score from segment flags."""
 
@@ -232,6 +254,7 @@ class Microsegmenter:
         output_df["exp_grocery"] = output_df.apply(
             lambda row: _flag_segment(row, "grocery", self.regexes), axis=1
         )
+        output_df["exp_quick_comm"] = output_df.apply(_flag_quick_comm, axis=1)
         output_df["exp_ecomm"] = output_df.apply(
             lambda row: _flag_segment(row, "ecomm", self.regexes), axis=1
         )

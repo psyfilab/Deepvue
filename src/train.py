@@ -28,6 +28,7 @@ if __package__ in {None, ""}:
         PromptArtifacts,
         build_exact_lookup,
         build_initial_prompt_dataset,
+        build_level5_keyword_cues,
         build_merchant_aliases,
         rebuild_prompt_dataset,
     )
@@ -40,6 +41,7 @@ else:
         PromptArtifacts,
         build_exact_lookup,
         build_initial_prompt_dataset,
+        build_level5_keyword_cues,
         build_merchant_aliases,
         rebuild_prompt_dataset,
     )
@@ -114,7 +116,9 @@ def apply_bundle_prediction(
 
     from src.prompt_part3 import (
         clean_entity,
+        detect_counterparty_marker,
         detect_explicit_purpose,
+        detect_level5_keyword_cue,
         detect_manual_merchant,
         detect_p2p_entity,
         detect_platform_or_bank,
@@ -151,6 +155,11 @@ def apply_bundle_prediction(
         result.update({key: value for key, value in merchant_hit.items() if value})
 
     if not result["Level_3"]:
+        counterparty_marker = detect_counterparty_marker(keyword)
+        if counterparty_marker:
+            result["Level_3"] = counterparty_marker
+
+    if not result["Level_3"]:
         p2p_entity = detect_p2p_entity(keyword, artifacts.merchant_aliases)
         if p2p_entity:
             result["Level_3"] = "p2p"
@@ -183,6 +192,26 @@ def apply_bundle_prediction(
         explicit_purpose = detect_explicit_purpose(keyword)
         if explicit_purpose:
             result["Level_5"] = explicit_purpose
+            if (
+                result["Level_3"] == "p2p"
+                and result["Level_6"] == clean_entity(keyword)
+                and explicit_purpose not in {"p2p transfer", "salary"}
+            ):
+                result["Level_3"] = "merchant"
+
+    if not result["Level_5"]:
+        cue_purpose = detect_level5_keyword_cue(
+            keyword,
+            getattr(artifacts, "level5_keyword_cues", {}),
+        )
+        if cue_purpose:
+            result["Level_5"] = cue_purpose
+            if (
+                result["Level_3"] == "p2p"
+                and result["Level_6"] == clean_entity(keyword)
+                and cue_purpose not in {"p2p transfer", "salary"}
+            ):
+                result["Level_3"] = "merchant"
 
     if (
         not result["Level_5"]
@@ -363,6 +392,7 @@ def main() -> int:
     prompt_df = build_initial_prompt_dataset(master_df)
     merchant_aliases = build_merchant_aliases(prompt_df)
     prompt_df = rebuild_prompt_dataset(prompt_df, merchant_aliases)
+    level5_keyword_cues = build_level5_keyword_cues(prompt_df)
 
     preprocessor = KeywordPreprocessor()
     prompt_df[PROCESSED_KEYWORD_COLUMN] = preprocessor.transform_batch(prompt_df["Key Word"].tolist())
@@ -385,6 +415,7 @@ def main() -> int:
         merchant_aliases=merchant_aliases,
         platform_aliases={alias: name for name, aliases in MANUAL_PLATFORM_ALIASES.items() for alias in aliases},
         metadata={},
+        level5_keyword_cues=level5_keyword_cues,
     )
 
     holdout_path = reports_dir / "part3_holdout_predictions.tsv"

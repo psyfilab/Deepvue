@@ -10,6 +10,25 @@ import pandas as pd
 
 logger = logging.getLogger(__name__)
 
+P2_INDICATOR_RE = re.compile(r"^P2[A-Z]$", flags=re.IGNORECASE)
+
+
+def normalize_part(part: str) -> str:
+    """Normalize one narration part while preserving exact P2 markers."""
+
+    value = "" if part is None else str(part).upper()
+    value = re.sub(r"\s+", " ", value).strip()
+    if not value:
+        return ""
+
+    compact = re.sub(r"[^A-Z0-9]", "", value)
+    if P2_INDICATOR_RE.fullmatch(compact):
+        return compact
+
+    value = re.sub(r"\d+", "", value)
+    value = re.sub(r"\s+", " ", value).strip()
+    return value
+
 
 def split_narration(text: str, max_parts: int = 8) -> list[str]:
     """Split a raw narration into stable uppercase parts."""
@@ -17,10 +36,10 @@ def split_narration(text: str, max_parts: int = 8) -> list[str]:
     value = "" if text is None else str(text).upper()
     value = re.sub(r"\bTO\s+TRANSFER\s*-", "TO TRANSFER/", value)
     value = re.sub(r"\bBY\s+TRANSFER\s*-", "BY TRANSFER/", value)
-    value = re.sub(r"\d+", "", value)
 
     raw_parts = re.split(r"[/\-*]", value)
-    parts = [part.strip() for part in raw_parts if part and part.strip()]
+    parts = [normalize_part(part) for part in raw_parts]
+    parts = [part for part in parts if part]
     return parts[:max_parts]
 
 
