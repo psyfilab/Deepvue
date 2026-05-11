@@ -285,6 +285,7 @@ python src/run_statement_pipeline.py --input "Raw Data\\1.xlsx" --models models/
 ```bash
 python src/run_statement_folder.py --input-dir "Raw Data" --models models/ --master MASTER_SHEET.csv --window-days 10 --output reports/all_statements_salary_timeseries_v4.xlsx
 ```
+python src/run_statement_folder.py --input-dir "Raw Data" --models models/ --master MASTER_SHEET.csv --output reports/all_statements_classified.xlsx
 
 ## Output Artifacts
 
