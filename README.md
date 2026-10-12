@@ -5,6 +5,7 @@ This repository is the working MVP for a local-first bank statement intelligence
 ## Project Purpose
 
 The core problem this MVP solves is that raw bank statement narrations are messy, inconsistent, abbreviated, and difficult to use directly for downstream analytics. A single narration may include rail information, direction, merchant markers, bank names, person names, or category hints all at once. This project converts those noisy strings into a structured, auditable output that can support classification, review operations, micro-segmentation, and behavior analytics.
+The project is being maintained and improved by the PSYFI Labs team.
 
 At a high level, the system does four things:
 
@@ -285,6 +286,7 @@ python src/run_statement_pipeline.py --input "Raw Data\\1.xlsx" --models models/
 ```bash
 python src/run_statement_folder.py --input-dir "Raw Data" --models models/ --master MASTER_SHEET.csv --window-days 10 --output reports/all_statements_salary_timeseries_v4.xlsx
 ```
+
 python src/run_statement_folder.py --input-dir "Raw Data" --models models/ --master MASTER_SHEET.csv --output reports/all_statements_classified.xlsx
 
 ## Output Artifacts
