@@ -10,7 +10,9 @@ from pathlib import Path
 import pandas as pd
 
 if __package__ in {None, ""}:
-    sys.path.append(str(Path(__file__).resolve().parent.parent))
+    # Put the project root first so the working-tree ``src`` package is
+    # imported, not an older installed or cached copy found earlier on sys.path.
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
     from src.microsegment import Microsegmenter
     from src.salary_timeseries import build_salary_time_series, save_salary_timeline_plots
     from src.statement_classifier import BankStatementClassifier, build_salary_summary

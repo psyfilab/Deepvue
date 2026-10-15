@@ -29,6 +29,33 @@ SLASH_UPI_RE = re.compile(
     r"\bUPI\b(?:/\d+)?/(?:DR|CR)(?:/\d+)?/([^/\d\-][^/]{1,19})/([A-Z]{2,6})/(\S+)",
     flags=re.IGNORECASE,
 )
+# Explicit merchant marker as its own narration segment, e.g. ".../MERCHANT/...".
+# Segments may be separated by "/" (raw slash format) or "|" (pipe format /
+# joined split parts), so both are accepted.
+MERCHANT_MARKER_RE = re.compile(
+    r"(?:^|[/|])\s*MERCHANT\s*(?:[/|]|$)",
+    flags=re.IGNORECASE,
+)
+# ATM cash withdrawal narrations, e.g. "ATM WDL ...", "ATM-WDL", "ATM/DR/...",
+# or the same segments in pipe format ("ATM | DR | ...").
+ATM_WITHDRAWAL_RE = re.compile(
+    r"\bATM[\s\-/|]*WDL\b|\bATM\s*[/|]\s*DR\s*(?:[/|]|$)",
+    flags=re.IGNORECASE,
+)
+
+
+def _marker_text(particulars: str, part_texts: list[str] | None = None) -> str:
+    """Return the narration plus its split parts, joined for marker detection.
+
+    The split parts keep each narration segment intact even when the
+    Particulars text has been normalised, so explicit markers such as
+    MERCHANT or ATM/DR are detected in either form.
+    """
+
+    pieces = [str(particulars or "")]
+    if part_texts:
+        pieces.append(" | ".join(part.strip() for part in part_texts if part and part.strip()))
+    return " | ".join(piece for piece in pieces if piece)
 GATEWAY_VPA_FRAGMENTS = frozenset(
     {
         "gpay",
@@ -210,8 +237,13 @@ def apply_structured_upi_overrides(
 def apply_raw_transaction_overrides(
     particulars: str,
     result: dict[str, str],
+    part_texts: list[str] | None = None,
 ) -> dict[str, str]:
-    """Override part aggregation when the raw narration structure is explicit."""
+    """Override part aggregation when the raw narration structure is explicit.
+
+    ``part_texts`` (the row's split parts) is used only to detect an explicit
+    MERCHANT marker when it is not visible in the Particulars text.
+    """
 
     text = str(particulars or "")
     match = SLASH_UPI_RE.search(text.upper())
@@ -224,12 +256,18 @@ def apply_raw_transaction_overrides(
 
         result["Level_1"] = result["Level_1"] or "upi"
         result["Level_4"] = bank_name or result["Level_4"]
-        result["Level_6"] = name
+        if name != "merchant":
+            result["Level_6"] = name
         if is_gateway:
             result["Level_3"] = "merchant"
         else:
             result["Level_3"] = "p2p"
             result["Level_5"] = "p2p transfer"
+
+    if MERCHANT_MARKER_RE.search(_marker_text(text, part_texts)):
+        result["Level_3"] = "merchant"
+        if result["Level_5"] == "p2p transfer":
+            result["Level_5"] = ""
 
     if SALARY_KEYWORDS.search(text):
         entity = SALARY_KEYWORDS.sub("", text)
@@ -241,6 +279,47 @@ def apply_raw_transaction_overrides(
         result["Level_6"] = entity
 
     return _apply_transaction_rules(result)
+
+
+def apply_atm_withdrawal_overrides(
+    particulars: str,
+    part_predictions: list[tuple[str, dict[str, str]]],
+    result: dict[str, str],
+    debit_value: object = None,
+    credit_value: object = None,
+) -> dict[str, str]:
+    """Mark ATM cash withdrawals as cash and drop contradictory P2P labels.
+
+    Runs after the other row-level overrides and does not re-apply the
+    generic cash rule, so bank and ATM details (Level_4 / Level_6) are kept.
+    Credit rows (e.g. failed ATM reversals) are left unchanged.
+    """
+
+    text = _marker_text(particulars, [part_text for part_text, _ in part_predictions])
+    if not ATM_WITHDRAWAL_RE.search(text):
+        return result
+    if derive_direction_from_amounts(debit_value, credit_value) == "credit":
+        return result
+
+    bank_name = result["Level_4"]
+    location = result["Level_6"]
+    for _, prediction in part_predictions:
+        if not bank_name and prediction.get("Level_4"):
+            bank_name = prediction["Level_4"]
+        if not location and prediction.get("Level_6") and prediction.get("Level_3") != "p2p":
+            location = prediction["Level_6"]
+
+    result["Level_1"] = "cash"
+    if result["Level_3"] in {"p2p", "merchant"}:
+        result["Level_3"] = ""
+    if result["Level_5"] in {"p2p transfer", "salary"}:
+        result["Level_5"] = ""
+    result["Level_4"] = bank_name
+    result["Level_6"] = location
+    if bank_name and location and _normalize_compare(bank_name) == _normalize_compare(location):
+        result["Level_6"] = ""
+
+    return result
 
 
 def apply_amount_direction_override(
@@ -471,6 +550,14 @@ class BankStatementClassifier:
             row_prediction = apply_raw_transaction_overrides(
                 str(output_df.loc[row_index, "Particulars"]),
                 row_prediction,
+                [part_text for part_text, _ in row_parts],
+            )
+            row_prediction = apply_atm_withdrawal_overrides(
+                str(output_df.loc[row_index, "Particulars"]),
+                row_parts,
+                row_prediction,
+                output_df.loc[row_index, "Debit"],
+                output_df.loc[row_index, "Credit"],
             )
             row_prediction = apply_amount_direction_override(
                 output_df.loc[row_index, "Debit"],
@@ -478,6 +565,28 @@ class BankStatementClassifier:
                 row_prediction,
             )
             row_level_predictions.append(row_prediction)
+
+        merchant_rows = sum(
+            prediction["Level_3"] == "merchant"
+            and bool(MERCHANT_MARKER_RE.search(_marker_text(
+                str(output_df.loc[row_index, "Particulars"]),
+                [part_text for part_text, _ in grouped_predictions.get(row_index, [])],
+            )))
+            for row_index, prediction in zip(output_df.index, row_level_predictions)
+        )
+        atm_rows = sum(
+            prediction["Level_1"] == "cash"
+            and bool(ATM_WITHDRAWAL_RE.search(_marker_text(
+                str(output_df.loc[row_index, "Particulars"]),
+                [part_text for part_text, _ in grouped_predictions.get(row_index, [])],
+            )))
+            for row_index, prediction in zip(output_df.index, row_level_predictions)
+        )
+        logger.info(
+            "Explicit-marker overrides applied: %s MERCHANT rows, %s ATM withdrawal rows",
+            merchant_rows,
+            atm_rows,
+        )
 
         levels_df = pd.DataFrame(row_level_predictions, index=output_df.index)
         output_df = pd.concat([output_df, levels_df], axis=1)
