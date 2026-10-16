@@ -8,8 +8,18 @@ from collections import defaultdict
 
 import pandas as pd
 
-from .predict import KeywordClassifier
-from .prompt_part3 import clean_entity, detect_explicit_purpose
+# Support both normal package imports (``from src.statement_classifier ...``)
+# and direct module loading from the repository root / ``src`` directory.
+if __package__:
+    from .predict import KeywordClassifier
+    from .prompt_part3 import clean_entity, detect_explicit_purpose
+else:  # pragma: no cover - used by IDEs or scripts loading this file directly
+    try:
+        from src.predict import KeywordClassifier
+        from src.prompt_part3 import clean_entity, detect_explicit_purpose
+    except ModuleNotFoundError:
+        from predict import KeywordClassifier
+        from prompt_part3 import clean_entity, detect_explicit_purpose
 
 logger = logging.getLogger(__name__)
 
@@ -37,9 +47,11 @@ MERCHANT_MARKER_RE = re.compile(
     flags=re.IGNORECASE,
 )
 # ATM cash withdrawal narrations, e.g. "ATM WDL ...", "ATM-WDL", "ATM/DR/...",
-# or the same segments in pipe format ("ATM | DR | ...").
+# the same segments in pipe format ("ATM | DR | ..."), or the "ATW" form used
+# by several banks and the NFS network ("ATW-512345XXXXXX6789-...", "NFS/ATW/...").
+# ATW must stand alone as a token so words such as "ATWOOD" do not match.
 ATM_WITHDRAWAL_RE = re.compile(
-    r"\bATM[\s\-/|]*WDL\b|\bATM\s*[/|]\s*DR\s*(?:[/|]|$)",
+    r"\bATM[\s\-/|]*WDL\b|\bATM\s*[/|]\s*DR\s*(?:[/|]|$)|\bATW(?![A-Za-z])",
     flags=re.IGNORECASE,
 )
 
@@ -234,18 +246,40 @@ def apply_structured_upi_overrides(
     return _apply_transaction_rules(result)
 
 
+def apply_debit_salary_guard(
+    debit_value: object,
+    credit_value: object,
+    result: dict[str, str],
+) -> dict[str, str]:
+    """Drop a salary purpose from rows whose amounts say they are debits.
+
+    Salary is income, so it can only apply to credit rows. Rows with no usable
+    amounts (direction unknown) are left unchanged.
+    """
+
+    if derive_direction_from_amounts(debit_value, credit_value) == "debit":
+        if _normalize_compare(result.get("Level_5", "")) == "salary":
+            result["Level_5"] = ""
+    return result
+
+
 def apply_raw_transaction_overrides(
     particulars: str,
     result: dict[str, str],
     part_texts: list[str] | None = None,
+    debit_value: object = None,
+    credit_value: object = None,
 ) -> dict[str, str]:
     """Override part aggregation when the raw narration structure is explicit.
 
     ``part_texts`` (the row's split parts) is used only to detect an explicit
     MERCHANT marker when it is not visible in the Particulars text.
+    ``debit_value`` / ``credit_value`` are optional; when they show a debit, the
+    salary keyword override is skipped because salary is income.
     """
 
     text = str(particulars or "")
+    is_debit = derive_direction_from_amounts(debit_value, credit_value) == "debit"
     match = SLASH_UPI_RE.search(text.upper())
     if match:
         name = match.group(1).strip().lower()
@@ -269,7 +303,7 @@ def apply_raw_transaction_overrides(
         if result["Level_5"] == "p2p transfer":
             result["Level_5"] = ""
 
-    if SALARY_KEYWORDS.search(text):
+    if SALARY_KEYWORDS.search(text) and not is_debit:
         entity = SALARY_KEYWORDS.sub("", text)
         entity = re.sub(r"[\-/|]+", " ", entity)
         entity = re.sub(r"\s+", " ", entity).strip().lower()
@@ -310,10 +344,11 @@ def apply_atm_withdrawal_overrides(
             location = prediction["Level_6"]
 
     result["Level_1"] = "cash"
-    if result["Level_3"] in {"p2p", "merchant"}:
-        result["Level_3"] = ""
-    if result["Level_5"] in {"p2p transfer", "salary"}:
-        result["Level_5"] = ""
+    # An ATM withdrawal is a cash transaction, not a P2P/merchant payment or
+    # a salary transaction. Clear all purpose/entity-type labels that can
+    # contradict this (including "retail", which appeared in File 4).
+    result["Level_3"] = ""
+    result["Level_5"] = ""
     result["Level_4"] = bank_name
     result["Level_6"] = location
     if bank_name and location and _normalize_compare(bank_name) == _normalize_compare(location):
@@ -355,8 +390,9 @@ def derive_first_level_classification(row: pd.Series) -> str:
     level_2 = str(row.get("Level_2", "") or "").strip().lower()
     level_5 = str(row.get("Level_5", "") or "").strip().lower()
     particulars = str(row.get("Particulars", "") or "")
+    is_debit = debit_num > 0 and credit_num <= 0
 
-    if level_5 == "salary":
+    if level_5 == "salary" and not is_debit:
         return "Salary"
     if SALARY_KEYWORDS.search(particulars) and credit_num > 0:
         return "Salary"
@@ -418,6 +454,35 @@ def detect_salary(df: pd.DataFrame) -> pd.DataFrame:
     output_df["SalaryConfidence"] = 0.0
 
     credit_num = output_df["Credit"].apply(parse_amount)
+    debit_num = (
+        output_df["Debit"].apply(parse_amount)
+        if "Debit" in output_df.columns
+        else pd.Series(0.0, index=output_df.index)
+    )
+    # Salary is income: a row that is a debit can never be salary.
+    debit_mask = (debit_num > 0) & (credit_num <= 0)
+
+    # Remove stale salary labels from debit rows and re-derive their labels.
+    stale_level_5 = (
+        output_df["Level_5"].astype(str).str.strip().str.lower().eq("salary")
+        if "Level_5" in output_df.columns
+        else pd.Series(False, index=output_df.index)
+    )
+    stale_first_level = (
+        output_df["First Level Classification"].astype(str).str.strip().str.lower().eq("salary")
+    )
+    stale_mask = debit_mask & (stale_level_5 | stale_first_level)
+    if stale_mask.any():
+        if "Level_5" in output_df.columns:
+            output_df.loc[stale_mask & stale_level_5, "Level_5"] = ""
+        stale_rows = output_df.loc[stale_mask]
+        output_df.loc[stale_mask, "First Level Classification"] = stale_rows.apply(
+            derive_first_level_classification, axis=1
+        )
+        output_df.loc[stale_mask, "Second Level Classification"] = stale_rows.apply(
+            derive_second_level_classification, axis=1
+        )
+
     output_df["NormText"] = (
         output_df["Particulars"].astype(str)
         + " "
@@ -434,14 +499,14 @@ def detect_salary(df: pd.DataFrame) -> pd.DataFrame:
         .astype(str)
         .str.contains("salary", case=False, na=False)
         | (output_df["NormText"].str.contains(SALARY_KEYWORDS, na=False) & (credit_num >= MIN_SALARY))
-    )
+    ) & ~debit_mask
 
     output_df.loc[explicit_mask, "IsSalary"] = 1
     output_df.loc[explicit_mask, "SalaryConfidence"] = 1.0
 
     dates = pd.to_datetime(output_df.get("Date"), errors="coerce")
     candidates = output_df.index[
-        (~explicit_mask) & (credit_num >= MIN_SALARY) & dates.notna()
+        (~explicit_mask) & (~debit_mask) & (credit_num >= MIN_SALARY) & dates.notna()
     ]
 
     if len(candidates) >= 2:
@@ -464,6 +529,9 @@ def detect_salary(df: pd.DataFrame) -> pd.DataFrame:
             if score >= 0.60:
                 output_df.loc[indices, "IsSalary"] = 1
                 output_df.loc[indices, "SalaryConfidence"] = round(score, 2)
+
+    output_df.loc[debit_mask, "IsSalary"] = 0
+    output_df.loc[debit_mask, "SalaryConfidence"] = 0.0
 
     salary_mask = output_df["IsSalary"].eq(1)
     salary_entity = output_df["Particulars"].astype(str).map(extract_salary_entity)
@@ -551,6 +619,8 @@ class BankStatementClassifier:
                 str(output_df.loc[row_index, "Particulars"]),
                 row_prediction,
                 [part_text for part_text, _ in row_parts],
+                output_df.loc[row_index, "Debit"],
+                output_df.loc[row_index, "Credit"],
             )
             row_prediction = apply_atm_withdrawal_overrides(
                 str(output_df.loc[row_index, "Particulars"]),
@@ -558,6 +628,11 @@ class BankStatementClassifier:
                 row_prediction,
                 output_df.loc[row_index, "Debit"],
                 output_df.loc[row_index, "Credit"],
+            )
+            row_prediction = apply_debit_salary_guard(
+                output_df.loc[row_index, "Debit"],
+                output_df.loc[row_index, "Credit"],
+                row_prediction,
             )
             row_prediction = apply_amount_direction_override(
                 output_df.loc[row_index, "Debit"],
