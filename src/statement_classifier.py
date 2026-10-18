@@ -96,6 +96,23 @@ GATEWAY_VPA_FRAGMENTS = frozenset(
 )
 UPI_P2_MERCHANT_MARKERS = frozenset({"P2M", "P2V"})
 UPI_P2_P2P_MARKERS = frozenset({"P2A", "P2P"})
+# Payment intermediaries sit between the payer and the shop. They show up in
+# narrations (e.g. "RAZORPAYZOMATO", "PAYVIARAZORPAY") but are never the
+# merchant the person actually paid, so they are not used as the Level_6 name.
+PAYMENT_INTERMEDIARY_FRAGMENTS = frozenset(
+    {"gpay", "google", "paytm", "phonepe", "razorpay", "bharatpe", "mobikwik", "cred", "payu", "cashfree"}
+)
+KNOWN_MERCHANT_FRAGMENTS = GATEWAY_VPA_FRAGMENTS - PAYMENT_INTERMEDIARY_FRAGMENTS
+# Fallback Level_5 purpose for a recognised merchant when the keyword model has
+# no purpose for the merchant name itself.
+MERCHANT_DEFAULT_PURPOSES = {
+    "amazon": "retail",
+    "flipkart": "retail",
+    "zomato": "dining",
+    "swiggy": "dining",
+}
+# Hyphen-delimited UPI narrations, e.g. "UPI-<payee>-<vpa>@<psp>-<ifsc>-<ref>-<note>".
+HYPHEN_UPI_RE = re.compile(r"^\s*UPI\s*-", flags=re.IGNORECASE)
 BANK_CODE_TO_NAME = {
     "sbin": "state bank of india",
     "hdfc": "hdfc bank",
@@ -111,6 +128,11 @@ BANK_CODE_TO_NAME = {
     "union": "union bank of india",
     "paytm": "paytm",
 }
+BANK_NAMES = frozenset(BANK_CODE_TO_NAME.values())
+# IFSC prefixes are not always the same as the short bank codes above
+# (ICICI's IFSC starts with ICIC, while its VPA handle is "icici").
+IFSC_PREFIX_TO_BANK = {**BANK_CODE_TO_NAME, "icic": "icici bank"}
+IFSC_RE = re.compile(r"^[A-Z]{4}0[A-Z0-9]{6}$")
 
 
 def parse_amount(value: object) -> float:
@@ -242,6 +264,137 @@ def apply_structured_upi_overrides(
         result["Level_3"] = "p2p"
         result["Level_6"] = clean_entity(entity_text)
         result["Level_5"] = "p2p transfer"
+
+    return _apply_transaction_rules(result)
+
+
+def extract_hyphen_upi_merchant(particulars: str) -> str:
+    """Return the known merchant named in a hyphen-delimited UPI narration.
+
+    The narration is ``UPI-<payee>-<vpa>@<psp>-<ifsc>-<ref>-<note>``. Only the
+    VPA handle and the payee segment are searched, VPA first, because the
+    trailing note often names the payment gateway ("PAYVIARAZORPAY") or is
+    truncated ("REQUEST FROM AMAZO"). Payment intermediaries are not in the
+    merchant set, so a gateway can never be returned as the merchant. Returns
+    an empty string when no known merchant is found, or when an explicit
+    P2M/P2P marker means the structured UPI override already owns the row.
+    """
+
+    text = str(particulars or "")
+    if not HYPHEN_UPI_RE.match(text):
+        return ""
+
+    segments = [segment.strip() for segment in text.split("-")]
+    vpa_segment = next((segment for segment in segments[1:] if "@" in segment), "")
+    if not vpa_segment:
+        return ""
+
+    payee_segments = segments[1 : segments.index(vpa_segment)]
+    if payee_segments and (
+        payee_segments[0].upper().replace(" ", "") in UPI_P2_MERCHANT_MARKERS | UPI_P2_P2P_MARKERS
+    ):
+        return ""
+
+    for candidate in [vpa_segment.split("@", 1)[0], *payee_segments]:
+        letters = re.sub(r"[^a-z]", "", candidate.lower())
+        # Longest fragment first so the result does not depend on set ordering.
+        for fragment in sorted(KNOWN_MERCHANT_FRAGMENTS, key=lambda item: (-len(item), item)):
+            if fragment in letters:
+                return fragment
+    return ""
+
+
+def is_payment_intermediary_label(label: str) -> bool:
+    """Return True for a label that names a payment gateway rather than a bank.
+
+    Level_4 holds a bank. A label that is a known bank name (including
+    "paytm", which is a bank value in ``BANK_CODE_TO_NAME``) is never treated
+    as an intermediary.
+    """
+
+    value = _normalize_compare(label)
+    if not value or value in BANK_NAMES:
+        return False
+    letters = re.sub(r"[^a-z]", "", value)
+    return any(fragment in letters for fragment in PAYMENT_INTERMEDIARY_FRAGMENTS)
+
+
+def derive_upi_bank(particulars: str) -> str:
+    """Return the bank named by a UPI narration's IFSC prefix or VPA handle.
+
+    The IFSC (e.g. ``ICIC0DC0099``, even when split as ``ICI C0DC0099``) is
+    tried first, then the handle after ``@`` (e.g. ``@ICICI``). Returns an
+    empty string when neither identifies a bank in ``BANK_CODE_TO_NAME``.
+    """
+
+    segments = [segment.strip() for segment in str(particulars or "").split("-")]
+
+    for segment in segments:
+        compact = re.sub(r"\s+", "", segment).upper()
+        if IFSC_RE.match(compact):
+            bank = IFSC_PREFIX_TO_BANK.get(compact[:4].lower())
+            if bank:
+                return bank
+
+    vpa_segment = next((segment for segment in segments if "@" in segment), "")
+    handle = re.sub(r"[^a-z]", "", vpa_segment.split("@", 1)[1].lower()) if vpa_segment else ""
+    if handle:
+        if handle in BANK_CODE_TO_NAME:
+            return BANK_CODE_TO_NAME[handle]
+        for code, name in BANK_CODE_TO_NAME.items():
+            if len(code) >= 4 and handle.startswith(code):
+                return name
+    return ""
+
+
+def apply_hyphen_upi_merchant_override(
+    particulars: str,
+    part_predictions: list[tuple[str, dict[str, str]]],
+    keyword_classifier: KeywordClassifier,
+    result: dict[str, str],
+) -> dict[str, str]:
+    """Classify hyphen-format UPI payments to a known merchant as merchant rows.
+
+    Without this, only ``UPI/DR/...`` (slash) and ``UPI|P2M|...`` (split-marker)
+    narrations reach a merchant rule. A hyphen narration such as
+    ``UPI-YESBANK-AMAZON@YAPL-...`` keeps the bank-style labels of its parts
+    (``institution`` plus a bank in Level_4), and the institution rule in
+    ``_apply_transaction_rules`` then blanks Level_6.
+
+    Level_6 is the merchant, never the payment intermediary. Level_4 is a bank:
+    a valid bank already on the row is kept; an intermediary label such as
+    "razorpay" (or a blank) is replaced by the first valid bank any part
+    predicted, else the bank derived from the narration's IFSC or VPA handle,
+    else left blank.
+    """
+
+    merchant = extract_hyphen_upi_merchant(particulars)
+    if not merchant:
+        return result
+
+    purpose = keyword_classifier.classify(merchant).get("Level_5", "")
+    if not purpose or purpose in {"p2p transfer", "salary"}:
+        purpose = MERCHANT_DEFAULT_PURPOSES.get(merchant, "")
+
+    bank = "" if is_payment_intermediary_label(result["Level_4"]) else result["Level_4"]
+    if not bank:
+        bank = next(
+            (
+                prediction["Level_4"]
+                for _, prediction in part_predictions
+                if prediction.get("Level_4") and not is_payment_intermediary_label(prediction["Level_4"])
+            ),
+            "",
+        )
+    result["Level_4"] = bank or derive_upi_bank(particulars)
+
+    result["Level_1"] = result["Level_1"] or "upi"
+    result["Level_3"] = "merchant"
+    result["Level_6"] = merchant
+    if purpose:
+        result["Level_5"] = purpose
+    elif result["Level_5"] in {"p2p transfer", "salary"}:
+        result["Level_5"] = ""
 
     return _apply_transaction_rules(result)
 
@@ -611,6 +764,12 @@ class BankStatementClassifier:
             row_parts = grouped_predictions.get(row_index, [])
             row_prediction = aggregate_part_predictions(row_parts)
             row_prediction = apply_structured_upi_overrides(
+                row_parts,
+                self.keyword_classifier,
+                row_prediction,
+            )
+            row_prediction = apply_hyphen_upi_merchant_override(
+                str(output_df.loc[row_index, "Particulars"]),
                 row_parts,
                 self.keyword_classifier,
                 row_prediction,
