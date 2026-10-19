@@ -146,6 +146,301 @@ BANK_NAMES = frozenset(BANK_CODE_TO_NAME.values())
 IFSC_PREFIX_TO_BANK = {**BANK_CODE_TO_NAME, "icic": "icici bank"}
 IFSC_RE = re.compile(r"^[A-Z]{4}0[A-Z0-9]{6}$")
 
+# Level 4 precedence:
+# 1. Explicit payment platform / payment intermediary
+# 2. Explicit bank name or IFSC bank code
+# 3. Blank if neither is identifiable
+
+PLATFORM_ALIASES = {
+    "google pay": (
+        "google pay",
+        "googlepay",
+        "gpay",
+        "tez",
+    ),
+    "phonepe": (
+        "phonepe",
+        "phone pe",
+    ),
+    "paytm": (
+        "paytm",
+        "paytm upi",
+        "paytm payments bank",
+    ),
+    "amazon pay": (
+        "amazon pay",
+        "amazonpay",
+    ),
+    "bhim": (
+        "bhim",
+        "bharat interface for money",
+    ),
+    "bharatpe": (
+        "bharatpe",
+        "bharat pe",
+    ),
+    "mobikwik": (
+        "mobikwik",
+        "mobi kwik",
+    ),
+    "cred": (
+        "cred pay",
+        "cred",
+    ),
+    "whatsapp pay": (
+        "whatsapp pay",
+        "whatsapp payments",
+    ),
+    "jiofinance": (
+        "jiofinance",
+        "jio finance",
+    ),
+    "razorpay": (
+        "razorpay",
+        "razor pay",
+    ),
+    "cashfree": (
+        "cashfree",
+        "cash free",
+    ),
+    "payu": (
+        "payu",
+        "pay u",
+    ),
+    "billdesk": (
+        "billdesk",
+        "bill desk",
+    ),
+    "juspay": (
+        "juspay",
+        "jus pay",
+    ),
+    "pine labs": (
+        "pine labs",
+        "pinelabs",
+    ),
+    "payzapp": (
+        "payzapp",
+        "pay zapp",
+    ),
+    "freecharge": (
+        "freecharge",
+        "free charge",
+    ),
+    "mobikwik zip": (
+        "mobikwik zip",
+    ),
+}
+
+# Alias -> normalized bank name.
+# Keep IFSC prefixes and bank-name aliases together so both can be detected.
+BANK_ALIASES = {
+    "state bank of india": (
+        "state bank of india",
+        "sbi",
+        "sbin",
+    ),
+    "hdfc bank": (
+        "hdfc bank",
+        "hdfc",
+    ),
+    "icici bank": (
+        "icici bank",
+        "icici",
+    ),
+    "axis bank": (
+        "axis bank",
+        "axis",
+        "utib",
+    ),
+    "kotak mahindra bank": (
+        "kotak mahindra bank",
+        "kotak bank",
+        "kotak",
+    ),
+    "punjab national bank": (
+        "punjab national bank",
+        "pnb",
+        "punb",
+    ),
+    "bank of baroda": (
+        "bank of baroda",
+        "bob",
+    ),
+    "bank of india": (
+        "bank of india",
+        "boi",
+    ),
+    "canara bank": (
+        "canara bank",
+        "canara",
+        "cnrb",
+    ),
+    "union bank of india": (
+        "union bank of india",
+        "union bank",
+        "ubin",
+    ),
+    "indian bank": (
+        "indian bank",
+        "idib",
+    ),
+    "indian overseas bank": (
+        "indian overseas bank",
+        "iob",
+        "ioba",
+    ),
+    "central bank of india": (
+        "central bank of india",
+        "cbi",
+        "cbin",
+    ),
+    "uco bank": (
+        "uco bank",
+        "uco",
+    ),
+    "bank of maharashtra": (
+        "bank of maharashtra",
+        "mahabank",
+        "mahb",
+    ),
+    "punjab and sind bank": (
+        "punjab and sind bank",
+        "psb",
+        "psib",
+    ),
+    "yes bank": (
+        "yes bank",
+        "yesb",
+    ),
+    "idfc first bank": (
+        "idfc first bank",
+        "idfc bank",
+        "idfc",
+    ),
+    "indusind bank": (
+        "indusind bank",
+        "indusind",
+        "inbk",
+    ),
+    "federal bank": (
+        "federal bank",
+        "federal",
+        "fdr",
+    ),
+    "bandhan bank": (
+        "bandhan bank",
+        "bandhan",
+        "bdbl",
+    ),
+    "rbl bank": (
+        "rbl bank",
+        "rbl",
+    ),
+    "south indian bank": (
+        "south indian bank",
+        "sib",
+        "sibl",
+    ),
+    "karnataka bank": (
+        "karnataka bank",
+        "ktkb",
+    ),
+    "city union bank": (
+        "city union bank",
+        "ciub",
+    ),
+    "karur vysya bank": (
+        "karur vysya bank",
+        "kvb",
+        "kvbl",
+    ),
+    "dcb bank": (
+        "dcb bank",
+        "dcb",
+    ),
+    "tamilnad mercantile bank": (
+        "tamilnad mercantile bank",
+        "tmb",
+        "tmbl",
+    ),
+    "au small finance bank": (
+        "au small finance bank",
+        "au bank",
+        "aubl",
+    ),
+    "equitas small finance bank": (
+        "equitas small finance bank",
+        "equitas",
+        "esfb",
+    ),
+    "ujjivan small finance bank": (
+        "ujjivan small finance bank",
+        "ujjivan",
+        "usfb",
+    ),
+    "jana small finance bank": (
+        "jana small finance bank",
+        "jana",
+        "jsfb",
+    ),
+    "paytm payments bank": (
+        "paytm payments bank",
+        "paytm bank",
+    ),
+    "india post payments bank": (
+        "india post payments bank",
+        "ippb",
+    ),
+    "fino payments bank": (
+        "fino payments bank",
+        "fino",
+    ),
+    "airtel payments bank": (
+        "airtel payments bank",
+        "airtel bank",
+    ),
+}
+
+
+def _contains_alias(text: str, alias: str) -> bool:
+    """Match an alias as a phrase/token, not as part of a longer word."""
+    escaped = re.escape(alias.strip())
+    # Permit spaces in multi-word names to match repeated whitespace.
+    escaped = escaped.replace(r"\ ", r"\s+")
+    return bool(re.search(rf"(?<![A-Za-z0-9]){escaped}(?![A-Za-z0-9])", text))
+
+
+def detect_level_4_platform_or_bank(text: str) -> str:
+    """
+    Return platform first; if no platform is found, return the bank.
+    Returns an empty string when there is insufficient evidence.
+    """
+    normalized = str(text or "").lower()
+    if not normalized.strip():
+        return ""
+
+    # Longest alias first to avoid shorter aliases winning prematurely.
+    platform_matches = []
+    for canonical, aliases in PLATFORM_ALIASES.items():
+        for alias in aliases:
+            if _contains_alias(normalized, alias):
+                platform_matches.append((len(alias), canonical))
+    if platform_matches:
+        platform_matches.sort(reverse=True)
+        return platform_matches[0][1]
+
+    bank_matches = []
+    for canonical, aliases in BANK_ALIASES.items():
+        for alias in aliases:
+            if _contains_alias(normalized, alias):
+                bank_matches.append((len(alias), canonical))
+    if bank_matches:
+        bank_matches.sort(reverse=True)
+        return bank_matches[0][1]
+
+    return ""
+
 
 def parse_amount(value: object) -> float:
     """Convert a debit or credit cell into a positive float."""
@@ -202,7 +497,6 @@ def _apply_transaction_rules(result: dict[str, str]) -> dict[str, str]:
 
     if result["Level_5"] == "salary":
         result["Level_3"] = "institution"
-        result["Level_4"] = ""
 
     if result["Level_3"] == "institution" and result["Level_4"]:
         result["Level_6"] = ""
@@ -472,10 +766,19 @@ def apply_raw_transaction_overrides(
         entity = SALARY_KEYWORDS.sub("", text)
         entity = re.sub(r"[\-/|]+", " ", entity)
         entity = re.sub(r"\s+", " ", entity).strip().lower()
+
         result["Level_3"] = "institution"
-        result["Level_4"] = ""
         result["Level_5"] = "salary"
         result["Level_6"] = entity
+
+    # Level 4: payment platform takes precedence over bank.
+    # Do not overwrite the salary-specific classification.
+    if result.get("Level_5") != "salary":
+        level4_text = _marker_text(text, part_texts)
+        detected_level4 = detect_level_4_platform_or_bank(level4_text)
+
+        if detected_level4:
+            result["Level_4"] = detected_level4
 
     return _apply_transaction_rules(result)
 
@@ -740,7 +1043,6 @@ def detect_salary(df: pd.DataFrame) -> pd.DataFrame:
     output_df.loc[salary_mask, "Level_1"] = ""
     output_df.loc[salary_mask, "Level_2"] = "System generated"
     output_df.loc[salary_mask, "Level_3"] = "institution"
-    output_df.loc[salary_mask, "Level_4"] = ""
     output_df.loc[salary_mask, "Level_5"] = "salary"
     output_df.loc[salary_mask, "Level_7"] = ""
     output_df.loc[salary_mask, "Level_6"] = salary_entity.loc[salary_mask]
