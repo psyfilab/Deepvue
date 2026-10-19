@@ -1,6 +1,6 @@
 # Deepvue Bank Statement Intelligence MVP
 
-This repository is the working MVP for a local-first bank statement intelligence system built for [PSYFI](https://www.psyfilab.com/) and authored by Shreenand Bhattad. It classifies bank narration fragments into a structured taxonomy, enriches transactions with consumer-spend flags, detects salary credits, creates review sheets for unknown keywords, and generates statement-level analytics and plots. The system is designed to run fully offline on local files, with no external inference API and no cloud dependency at prediction time.
+This repository is the working MVP for a local-first bank statement intelligence system developed by the **Product Engineering Team at [PSYFI Lab](https://www.psyfilab.com/)**. It classifies bank narration fragments into a structured taxonomy, enriches transactions with consumer-spend flags, detects salary credits, creates review sheets for unknown keywords, and generates statement-level analytics and plots. The system is designed to run fully offline on local files, with no external inference API or cloud dependency at prediction time.
 
 ## Project Purpose
 
