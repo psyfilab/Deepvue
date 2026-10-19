@@ -55,9 +55,11 @@ ATM_WITHDRAWAL_RE = re.compile(
     flags=re.IGNORECASE,
 )
 SYSTEM_INITIATED_RE = re.compile(
-    r"\b(?:NACH|ACH|ECS|AUTO[\s-]?DEBIT|AUTODEBIT|AUTO[\s-]?PAY|"
-    r"AUTOPAY|STANDING\s+INSTRUCTION|RECURRING\s+PAYMENT|"
-    r"MANDATE|EMI(?:\s+DEBIT|\s+PAYMENT)?|LOAN\s+INSTAL?L?MENT)\b",
+    r"\b(?:NACH|ACH|ECS|AUTO[\s-]?DEBIT|AUTODEBIT|"
+    r"AUTO[\s-]?PAY|AUTOPAY|STANDING\s+INSTRUCTION|"
+    r"RECURRING\s+PAYMENT|UPI\s+MANDATE|SI[\s-]?DEBIT|"
+    r"MANDATE|EMI(?:\s+DEBIT|\s+PAYMENT)?|"
+    r"LOAN\s+INSTAL?L?MENT)\b",
     flags=re.IGNORECASE,
 )
 
@@ -108,6 +110,23 @@ GATEWAY_VPA_FRAGMENTS = frozenset(
 )
 UPI_P2_MERCHANT_MARKERS = frozenset({"P2M", "P2V"})
 UPI_P2_P2P_MARKERS = frozenset({"P2A", "P2P"})
+KNOWN_UPI_MERCHANTS = {
+    "kettoorg": "ketto",
+    "milaap": "milaap",
+    "lalpathlabs": "lal path labs",
+    "artofliving": "art of living",
+    "freshtohome": "fresh to home",
+    "urbancompany": "urban company",
+    "simpl": "simpl",
+    "indigo": "indigo",
+    "dlfavenuesaket": "dlf avenue saket",
+    "impactguru": "impact guru",
+    "lop eragreenpark".replace(" ", ""): "l opera green park",
+    "cdhpromenade": "cdh promenade",
+    "petmojomangopawtec": "petmojo",
+    "delfiniumfertility": "delfinium fertility",
+    "ferticityivfclinic": "ferticity ivf clinic",
+}
 # Payment intermediaries sit between the payer and the shop. They show up in
 # narrations (e.g. "RAZORPAYZOMATO", "PAYVIARAZORPAY") but are never the
 # merchant the person actually paid, so they are not used as the Level_6 name.
@@ -729,16 +748,29 @@ def apply_raw_transaction_overrides(
     debit_value: object = None,
     credit_value: object = None,
 ) -> dict[str, str]:
-    """Override part aggregation when the raw narration structure is explicit.
-
-    ``part_texts`` (the row's split parts) is used only to detect an explicit
-    MERCHANT marker when it is not visible in the Particulars text.
-    ``debit_value`` / ``credit_value`` are optional; when they show a debit, the
-    salary keyword override is skipped because salary is income.
-    """
+    """Apply row-level overrides only when narration provides useful evidence."""
 
     text = str(particulars or "")
-    is_debit = derive_direction_from_amounts(debit_value, credit_value) == "debit"
+    direction = derive_direction_from_amounts(debit_value, credit_value)
+    is_debit = direction == "debit"
+    marker_text = _marker_text(text, part_texts)
+
+    # ACH credits are institutional receipts, not person-to-person transfers.
+    # Only assign dividend purpose when the narration explicitly supports it.
+    if re.search(r"\bACH\b", marker_text, flags=re.IGNORECASE) and direction == "credit":
+        result["Level_3"] = "institution"
+        if re.search(r"\bDIVIDEND(?:S)?\b", marker_text, flags=re.IGNORECASE):
+            result["Level_5"] = "dividend"
+        elif result.get("Level_5") == "p2p transfer":
+            result["Level_5"] = ""
+
+    # System-initiated debits, including card autopay, are not P2P transfers.
+    if SYSTEM_INITIATED_RE.search(marker_text) and is_debit:
+        if result.get("Level_3") == "p2p":
+            result["Level_3"] = "institution"
+        if result.get("Level_5") == "p2p transfer":
+            result["Level_5"] = ""
+
     match = SLASH_UPI_RE.search(text.upper())
     if match:
         name = match.group(1).strip().lower()
@@ -749,19 +781,36 @@ def apply_raw_transaction_overrides(
 
         result["Level_1"] = result["Level_1"] or "upi"
         result["Level_4"] = bank_name or result["Level_4"]
+
         if name != "merchant":
             result["Level_6"] = name
+
         if is_gateway:
             result["Level_3"] = "merchant"
+            if result.get("Level_5") == "p2p transfer":
+                result["Level_5"] = ""
         else:
-            result["Level_3"] = "p2p"
-            result["Level_5"] = "p2p transfer"
+            # A non-gateway handle alone does not prove this is P2P.
+            # Preserve a useful merchant purpose already found by the classifier.
+            purpose = result.get("Level_5", "")
+            if (
+                purpose
+                and purpose not in {"p2p transfer", "salary"}
+                and result.get("Level_3") != "institution"
+            ):
+                result["Level_3"] = "merchant"
+            elif result.get("Level_3") == "p2p" and purpose == "p2p transfer":
+                # Avoid confidently labelling an ambiguous transaction as P2P.
+                result["Level_3"] = ""
+                result["Level_5"] = ""
 
-    if MERCHANT_MARKER_RE.search(_marker_text(text, part_texts)):
+    # An explicit MERCHANT marker takes precedence over a generic P2P label.
+    if MERCHANT_MARKER_RE.search(marker_text):
         result["Level_3"] = "merchant"
-        if result["Level_5"] == "p2p transfer":
+        if result.get("Level_5") == "p2p transfer":
             result["Level_5"] = ""
 
+    # Salary is income and must not be inferred from a debit.
     if SALARY_KEYWORDS.search(text) and not is_debit:
         entity = SALARY_KEYWORDS.sub("", text)
         entity = re.sub(r"[\-/|]+", " ", entity)
@@ -771,14 +820,36 @@ def apply_raw_transaction_overrides(
         result["Level_5"] = "salary"
         result["Level_6"] = entity
 
-    # Level 4: payment platform takes precedence over bank.
-    # Do not overwrite the salary-specific classification.
+    # Level 4: payment platform / bank detection.
     if result.get("Level_5") != "salary":
-        level4_text = _marker_text(text, part_texts)
-        detected_level4 = detect_level_4_platform_or_bank(level4_text)
-
+        detected_level4 = detect_level_4_platform_or_bank(marker_text)
         if detected_level4:
             result["Level_4"] = detected_level4
+
+    # Correct known merchant UPI transactions without changing
+    # their already-detected purpose.
+    upper_text = text.upper()
+    parts = upper_text.split("-", 2)
+    first_part = parts[1].strip() if len(parts) > 1 else ""
+    merchant_key = re.sub(r"[^a-z0-9]", "", first_part.lower())
+
+    merchant_name = KNOWN_UPI_MERCHANTS.get(merchant_key)
+
+    # PAYTMQR is evidence of a QR merchant payment.
+    is_paytm_qr = "PAYTMQR" in upper_text
+
+    if upper_text.startswith("UPI-") and (merchant_name or is_paytm_qr):
+        result["Level_3"] = "merchant"
+
+        if merchant_name:
+            result["Level_6"] = merchant_name
+        elif not result.get("Level_6"):
+            result["Level_6"] = first_part.lower()
+
+        # Remove an unsupported P2P purpose but preserve useful
+        # purposes such as grocery, retail, or digital services.
+        if result.get("Level_5") == "p2p transfer":
+            result["Level_5"] = ""
 
     return _apply_transaction_rules(result)
 
@@ -1075,15 +1146,7 @@ def build_salary_summary(df: pd.DataFrame) -> pd.DataFrame:
     return salary_df[available_columns].reset_index(drop=True)
 
 
-# Level 2: Initiation Mode
-SYSTEM_INITIATED_RE = re.compile(
-    r"\b(?:NACH|ACH|ECS|AUTO[\s-]?DEBIT|AUTOPAY|"
-    r"AUTO[\s-]?PAY|STANDING\s+INSTRUCTION|"
-    r"RECURRING\s+PAYMENT|UPI\s+MANDATE|"
-    r"SI[\s-]?DEBIT)\b",
-    flags=re.IGNORECASE,
-)
-
+# Level 2: Initiation Mode (SYSTEM_INITIATED_RE is defined near the top of the file)
 USER_INITIATED_RE = re.compile(
     r"\b(?:ATM[\s/-]*WDL|ATM\s+CASH\s+WITHDRAWAL|"
     r"POS\s+PURCHASE|CARD\s+PURCHASE)\b",
