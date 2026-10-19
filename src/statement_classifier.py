@@ -54,6 +54,18 @@ ATM_WITHDRAWAL_RE = re.compile(
     r"\bATM[\s\-/|]*WDL\b|\bATM\s*[/|]\s*DR\s*(?:[/|]|$)|\bATW(?![A-Za-z])",
     flags=re.IGNORECASE,
 )
+SYSTEM_INITIATED_RE = re.compile(
+    r"\b(?:NACH|ACH|ECS|AUTO[\s-]?DEBIT|AUTODEBIT|AUTO[\s-]?PAY|"
+    r"AUTOPAY|STANDING\s+INSTRUCTION|RECURRING\s+PAYMENT|"
+    r"MANDATE|EMI(?:\s+DEBIT|\s+PAYMENT)?|LOAN\s+INSTAL?L?MENT)\b",
+    flags=re.IGNORECASE,
+)
+
+EXPLICIT_UPI_RE = re.compile(r"\bUPI\b", flags=re.IGNORECASE)
+MANUAL_TRANSFER_RE = re.compile(
+    r"\b(?:NEFT|IMPS|RTGS)\b",
+    flags=re.IGNORECASE,
+)
 
 
 def _marker_text(particulars: str, part_texts: list[str] | None = None) -> str:
@@ -510,6 +522,42 @@ def apply_atm_withdrawal_overrides(
     return result
 
 
+def apply_initiation_mode_override(
+    particulars: str,
+    result: dict[str, str],
+    debit_value: object = None,
+    credit_value: object = None,
+    part_texts: list[str] | None = None,
+) -> dict[str, str]:
+    """Classify Level 2 when transaction narration provides clear evidence."""
+
+    text = _marker_text(particulars, part_texts)
+    direction = derive_direction_from_amounts(debit_value, credit_value)
+
+    # Explicit automatic-payment mechanisms take priority.
+    if SYSTEM_INITIATED_RE.search(text):
+        result["Level_2"] = "System generated"
+        return result
+
+    # Agreed project rule: explicitly identified salary credits are system-generated.
+    if SALARY_KEYWORDS.search(text) and direction == "credit":
+        result["Level_2"] = "System generated"
+        return result
+
+    # Outgoing payments and ATM withdrawals are treated as user-initiated.
+    # Do not infer initiation mode for incoming transfers from the rail alone.
+    if direction == "debit":
+        if (
+            ATM_WITHDRAWAL_RE.search(text)
+            or EXPLICIT_UPI_RE.search(text)
+            or MANUAL_TRANSFER_RE.search(text)
+        ):
+            result["Level_2"] = "User-generated"
+
+    # Ambiguous transactions remain blank.
+    return result
+
+
 def apply_amount_direction_override(
     debit_value: object,
     credit_value: object,
@@ -690,7 +738,7 @@ def detect_salary(df: pd.DataFrame) -> pd.DataFrame:
     salary_entity = output_df["Particulars"].astype(str).map(extract_salary_entity)
     output_df.loc[salary_mask, "Level_0"] = "credit"
     output_df.loc[salary_mask, "Level_1"] = ""
-    output_df.loc[salary_mask, "Level_2"] = ""
+    output_df.loc[salary_mask, "Level_2"] = "System generated"
     output_df.loc[salary_mask, "Level_3"] = "institution"
     output_df.loc[salary_mask, "Level_4"] = ""
     output_df.loc[salary_mask, "Level_5"] = "salary"
@@ -723,6 +771,41 @@ def build_salary_summary(df: pd.DataFrame) -> pd.DataFrame:
     ]
     available_columns = [column for column in summary_columns if column in salary_df.columns]
     return salary_df[available_columns].reset_index(drop=True)
+
+
+# Level 2: Initiation Mode
+SYSTEM_INITIATED_RE = re.compile(
+    r"\b(?:NACH|ACH|ECS|AUTO[\s-]?DEBIT|AUTOPAY|"
+    r"AUTO[\s-]?PAY|STANDING\s+INSTRUCTION|"
+    r"RECURRING\s+PAYMENT|UPI\s+MANDATE|"
+    r"SI[\s-]?DEBIT)\b",
+    flags=re.IGNORECASE,
+)
+
+USER_INITIATED_RE = re.compile(
+    r"\b(?:ATM[\s/-]*WDL|ATM\s+CASH\s+WITHDRAWAL|"
+    r"POS\s+PURCHASE|CARD\s+PURCHASE)\b",
+    flags=re.IGNORECASE,
+)
+
+
+def apply_strict_level2(df: pd.DataFrame) -> pd.DataFrame:
+    """Assign initiation mode only when narration has explicit evidence."""
+    output_df = df.copy()
+    output_df["Level_2"] = ""
+
+    for idx, row in output_df.iterrows():
+        particulars = str(row.get("Particulars", "") or "").strip()
+
+        # Automated payment evidence takes precedence.
+        if SYSTEM_INITIATED_RE.search(particulars):
+            output_df.at[idx, "Level_2"] = "System generated"
+
+        # Only explicit, recognizable user-initiated transaction markers.
+        elif USER_INITIATED_RE.search(particulars):
+            output_df.at[idx, "Level_2"] = "User-generated"
+
+    return output_df
 
 
 class BankStatementClassifier:
@@ -788,6 +871,13 @@ class BankStatementClassifier:
                 output_df.loc[row_index, "Debit"],
                 output_df.loc[row_index, "Credit"],
             )
+            row_prediction = apply_initiation_mode_override(
+                str(output_df.loc[row_index, "Particulars"]),
+                row_prediction,
+                output_df.loc[row_index, "Debit"],
+                output_df.loc[row_index, "Credit"],
+                [part_text for part_text, _ in row_parts],
+            )
             row_prediction = apply_debit_salary_guard(
                 output_df.loc[row_index, "Debit"],
                 output_df.loc[row_index, "Credit"],
@@ -834,5 +924,6 @@ class BankStatementClassifier:
         )
 
         output_df = detect_salary(output_df)
+        output_df = apply_strict_level2(output_df)
         logger.info("Classified %s statement rows", len(output_df))
         return output_df
