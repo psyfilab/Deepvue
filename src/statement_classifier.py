@@ -55,11 +55,18 @@ ATM_WITHDRAWAL_RE = re.compile(
     flags=re.IGNORECASE,
 )
 SYSTEM_INITIATED_RE = re.compile(
-    r"\b(?:NACH|ACH|ECS|AUTO[\s-]?DEBIT|AUTODEBIT|"
-    r"AUTO[\s-]?PAY|AUTOPAY|STANDING\s+INSTRUCTION|"
-    r"RECURRING\s+PAYMENT|UPI\s+MANDATE|SI[\s-]?DEBIT|"
-    r"MANDATE|EMI(?:\s+DEBIT|\s+PAYMENT)?|"
-    r"LOAN\s+INSTAL?L?MENT)\b",
+    r"\b(?:"
+    r"NACH|ACH|ECS|"
+    r"AUTO[\s-]?DEBIT|AUTODEBIT|"
+    r"AUTO[\s-]?PAY|AUTOPAY|"
+    r"STANDING\s+INSTRUCTION|"
+    r"RECURRING\s+PAYMENT|"
+    r"UPI\s+MANDATE|"
+    r"SI[\s-]?DEBIT|"
+    r"MANDATE|"
+    r"EMI(?:\s+DEBIT|\s+PAYMENT)?|"
+    r"LOAN\s+INSTAL(?:L)?MENT"
+    r")\b",
     flags=re.IGNORECASE,
 )
 
@@ -250,6 +257,43 @@ PLATFORM_ALIASES = {
         "mobikwik zip",
     ),
 }
+
+# Distinctive platform names that are also recognised when glued to other
+# letters inside one narration token, e.g. "RAZORPAYZOMATO" or "PAYVIARAZORPAY".
+# Short or ambiguous aliases (cred, payu, bhim, tez, gpay) are deliberately
+# excluded because they occur inside ordinary words such as "CREDIT".
+EMBEDDED_PLATFORM_ALIASES = {
+    "razorpay": "razorpay",
+    "cashfree": "cashfree",
+    "billdesk": "billdesk",
+    "phonepe": "phonepe",
+    "bharatpe": "bharatpe",
+    "mobikwik": "mobikwik",
+    "juspay": "juspay",
+    "freecharge": "freecharge",
+    "payzapp": "payzapp",
+    "googlepay": "google pay",
+    "amazonpay": "amazon pay",
+    "pinelabs": "pine labs",
+    "paytm": "paytm",
+}
+
+# UPI handles (the part after "@" in a VPA) issued only by one app. Matched
+# only directly after "@", so words such as "OKAY" or "SYBIL" never count.
+# "okhdfc" covers narrations that truncate "@okhdfcbank".
+UPI_APP_HANDLES = {
+    "okicici": "google pay",
+    "okhdfcbank": "google pay",
+    "okhdfc": "google pay",
+    "oksbi": "google pay",
+    "okaxis": "google pay",
+    "ybl": "phonepe",
+    "ibl": "phonepe",
+    "axl": "phonepe",
+}
+UPI_APP_HANDLE_RE = re.compile(
+    r"@\s*(okhdfcbank|okhdfc|okicici|oksbi|okaxis|ybl|ibl|axl)(?![a-z0-9])"
+)
 
 # Alias -> normalized bank name.
 # Keep IFSC prefixes and bank-name aliases together so both can be detected.
@@ -449,6 +493,21 @@ def detect_level_4_platform_or_bank(text: str) -> str:
         platform_matches.sort(reverse=True)
         return platform_matches[0][1]
 
+    # A distinctive platform name glued inside a longer token still counts as
+    # platform evidence and must win over any bank in the same narration.
+    for token in re.findall(r"[a-z0-9]+", normalized):
+        for alias, canonical in EMBEDDED_PLATFORM_ALIASES.items():
+            if alias in token:
+                platform_matches.append((len(alias), canonical))
+    if platform_matches:
+        platform_matches.sort(reverse=True)
+        return platform_matches[0][1]
+
+    # A UPI handle that only one app issues is reliable platform evidence.
+    handle_match = UPI_APP_HANDLE_RE.search(normalized)
+    if handle_match:
+        return UPI_APP_HANDLES[handle_match.group(1)]
+
     bank_matches = []
     for canonical, aliases in BANK_ALIASES.items():
         for alias in aliases:
@@ -499,23 +558,27 @@ def derive_direction_from_amounts(debit_value: object, credit_value: object) -> 
     return ""
 
 
-def _apply_transaction_rules(result: dict[str, str]) -> dict[str, str]:
-    """Apply a few row-level consistency rules after aggregation."""
+def _apply_transaction_rules(
+    result: dict[str, str],
+    default_p2p_purpose: bool = True,
+) -> dict[str, str]:
+    """Apply a few row-level consistency rules after aggregation.
 
-    if result["Level_3"] == "p2p" and not result["Level_5"]:
+    ``default_p2p_purpose`` lets a caller that has just cleared an unsupported
+    "p2p transfer" purpose stop the default below from putting it back.
+    """
+
+    if default_p2p_purpose and result["Level_3"] == "p2p" and not result["Level_5"]:
         result["Level_5"] = "p2p transfer"
-
-    if not result["Level_3"] and result["Level_5"] == "salary":
-        result["Level_3"] = "institution"
 
     if result["Level_1"] == "cash":
         result["Level_3"] = ""
-        result["Level_4"] = ""
+        # Keep a bank (e.g. the bank of an ATM or cash deposit machine); a
+        # payment platform cannot apply to a cash transaction.
+        if is_payment_intermediary_label(result["Level_4"]):
+            result["Level_4"] = ""
         result["Level_5"] = ""
         result["Level_6"] = ""
-
-    if result["Level_5"] == "salary":
-        result["Level_3"] = "institution"
 
     if result["Level_3"] == "institution" and result["Level_4"]:
         result["Level_6"] = ""
@@ -541,6 +604,19 @@ def aggregate_part_predictions(
             level_name = f"Level_{level_index}"
             if not result[level_name] and prediction.get(level_name):
                 result[level_name] = prediction[level_name]
+
+    # Level 4 precedence: a payment intermediary predicted for any part wins
+    # over a bank predicted for an earlier part.
+    intermediary = next(
+        (
+            prediction["Level_4"]
+            for _, prediction in part_predictions
+            if prediction.get("Level_4") and is_payment_intermediary_label(prediction["Level_4"])
+        ),
+        "",
+    )
+    if intermediary:
+        result["Level_4"] = intermediary
 
     return _apply_transaction_rules(result)
 
@@ -630,14 +706,16 @@ def extract_hyphen_upi_merchant(particulars: str) -> str:
 
 
 def is_payment_intermediary_label(label: str) -> bool:
-    """Return True for a label that names a payment gateway rather than a bank.
+    """Return True for a label that names a payment platform/intermediary.
 
-    Level_4 holds a bank. A label that is a known bank name (including
-    "paytm", which is a bank value in ``BANK_CODE_TO_NAME``) is never treated
-    as an intermediary.
+    Level_4 holds the intermediary when one is identified, else the bank. A
+    canonical platform name from ``PLATFORM_ALIASES`` (including "paytm") is an
+    intermediary; any other known bank name is not.
     """
 
     value = _normalize_compare(label)
+    if value in PLATFORM_ALIASES:
+        return True
     if not value or value in BANK_NAMES:
         return False
     letters = re.sub(r"[^a-z]", "", value)
@@ -686,11 +764,12 @@ def apply_hyphen_upi_merchant_override(
     (``institution`` plus a bank in Level_4), and the institution rule in
     ``_apply_transaction_rules`` then blanks Level_6.
 
-    Level_6 is the merchant, never the payment intermediary. Level_4 is a bank:
-    a valid bank already on the row is kept; an intermediary label such as
-    "razorpay" (or a blank) is replaced by the first valid bank any part
-    predicted, else the bank derived from the narration's IFSC or VPA handle,
-    else left blank.
+    Level_6 is the merchant, never the payment intermediary. Level_4 is a
+    predicted payment intermediary (e.g. "razorpay") from the row or any part,
+    unless the narration's IFSC or VPA handle names a bank; otherwise the first
+    predicted bank, else the bank derived from the narration, else blank.
+    A platform named in the narration itself is applied afterwards by
+    ``apply_raw_transaction_overrides`` and takes precedence over all of these.
     """
 
     merchant = extract_hyphen_upi_merchant(particulars)
@@ -701,17 +780,21 @@ def apply_hyphen_upi_merchant_override(
     if not purpose or purpose in {"p2p transfer", "salary"}:
         purpose = MERCHANT_DEFAULT_PURPOSES.get(merchant, "")
 
-    bank = "" if is_payment_intermediary_label(result["Level_4"]) else result["Level_4"]
-    if not bank:
-        bank = next(
-            (
-                prediction["Level_4"]
-                for _, prediction in part_predictions
-                if prediction.get("Level_4") and not is_payment_intermediary_label(prediction["Level_4"])
-            ),
-            "",
-        )
-    result["Level_4"] = bank or derive_upi_bank(particulars)
+    level4_candidates = [result["Level_4"]] + [
+        prediction.get("Level_4", "") for _, prediction in part_predictions
+    ]
+    intermediary = next(
+        (label for label in level4_candidates if label and is_payment_intermediary_label(label)),
+        "",
+    )
+    bank = next(
+        (label for label in level4_candidates if label and not is_payment_intermediary_label(label)),
+        "",
+    )
+    narration_bank = derive_upi_bank(particulars)
+    # A predicted intermediary is a model guess; a bank named in the narration
+    # is evidence, so the predicted intermediary is used only without one.
+    result["Level_4"] = (intermediary if not narration_bank else "") or bank or narration_bank
 
     result["Level_1"] = result["Level_1"] or "upi"
     result["Level_3"] = "merchant"
@@ -758,16 +841,14 @@ def apply_raw_transaction_overrides(
     # ACH credits are institutional receipts, not person-to-person transfers.
     # Only assign dividend purpose when the narration explicitly supports it.
     if re.search(r"\bACH\b", marker_text, flags=re.IGNORECASE) and direction == "credit":
-        result["Level_3"] = "institution"
         if re.search(r"\bDIVIDEND(?:S)?\b", marker_text, flags=re.IGNORECASE):
             result["Level_5"] = "dividend"
         elif result.get("Level_5") == "p2p transfer":
             result["Level_5"] = ""
 
     # System-initiated debits, including card autopay, are not P2P transfers.
-    if SYSTEM_INITIATED_RE.search(marker_text) and is_debit:
-        if result.get("Level_3") == "p2p":
-            result["Level_3"] = "institution"
+    automated_debit = bool(SYSTEM_INITIATED_RE.search(marker_text)) and is_debit
+    if automated_debit:
         if result.get("Level_5") == "p2p transfer":
             result["Level_5"] = ""
 
@@ -790,7 +871,6 @@ def apply_raw_transaction_overrides(
             if result.get("Level_5") == "p2p transfer":
                 result["Level_5"] = ""
         else:
-            # A non-gateway handle alone does not prove this is P2P.
             # Preserve a useful merchant purpose already found by the classifier.
             purpose = result.get("Level_5", "")
             if (
@@ -799,10 +879,17 @@ def apply_raw_transaction_overrides(
                 and result.get("Level_3") != "institution"
             ):
                 result["Level_3"] = "merchant"
-            elif result.get("Level_3") == "p2p" and purpose == "p2p transfer":
-                # Avoid confidently labelling an ambiguous transaction as P2P.
-                result["Level_3"] = ""
-                result["Level_5"] = ""
+            elif (
+                result.get("Level_3") not in {"institution", "merchant"}
+                and purpose != "salary"
+                and not (SALARY_KEYWORDS.search(text) and not is_debit)
+                and not automated_debit
+            ):
+                # Plain UPI: a named payee at a bank, with no gateway handle,
+                # merchant purpose or merchant/institution label, is a P2P
+                # transfer. Explicit MERCHANT markers below still win.
+                result["Level_3"] = "p2p"
+                result["Level_5"] = "p2p transfer"
 
     # An explicit MERCHANT marker takes precedence over a generic P2P label.
     if MERCHANT_MARKER_RE.search(marker_text):
@@ -816,15 +903,14 @@ def apply_raw_transaction_overrides(
         entity = re.sub(r"[\-/|]+", " ", entity)
         entity = re.sub(r"\s+", " ", entity).strip().lower()
 
-        result["Level_3"] = "institution"
+        # Salary purpose does not establish counterparty type.
         result["Level_5"] = "salary"
         result["Level_6"] = entity
 
-    # Level 4: payment platform / bank detection.
-    if result.get("Level_5") != "salary":
-        detected_level4 = detect_level_4_platform_or_bank(marker_text)
-        if detected_level4:
-            result["Level_4"] = detected_level4
+    # Level 4: payment platform / bank detection (salary credits included).
+    detected_level4 = detect_level_4_platform_or_bank(marker_text)
+    if detected_level4:
+        result["Level_4"] = detected_level4
 
     # Correct known merchant UPI transactions without changing
     # their already-detected purpose.
@@ -851,7 +937,8 @@ def apply_raw_transaction_overrides(
         if result.get("Level_5") == "p2p transfer":
             result["Level_5"] = ""
 
-    return _apply_transaction_rules(result)
+    # Do not let the p2p default re-add a purpose the automated-debit rule cleared.
+    return _apply_transaction_rules(result, default_p2p_purpose=not automated_debit)
 
 
 def apply_atm_withdrawal_overrides(
@@ -876,6 +963,11 @@ def apply_atm_withdrawal_overrides(
 
     bank_name = result["Level_4"]
     location = result["Level_6"]
+    if not bank_name:
+        # The generic cash rule may have blanked a bank detected from the
+        # narration (e.g. "HDFC BANK ATM"); re-detect it before falling back to
+        # the part predictions.
+        bank_name = detect_level_4_platform_or_bank(text)
     for _, prediction in part_predictions:
         if not bank_name and prediction.get("Level_4"):
             bank_name = prediction["Level_4"]
@@ -1113,7 +1205,6 @@ def detect_salary(df: pd.DataFrame) -> pd.DataFrame:
     output_df.loc[salary_mask, "Level_0"] = "credit"
     output_df.loc[salary_mask, "Level_1"] = ""
     output_df.loc[salary_mask, "Level_2"] = "System generated"
-    output_df.loc[salary_mask, "Level_3"] = "institution"
     output_df.loc[salary_mask, "Level_5"] = "salary"
     output_df.loc[salary_mask, "Level_7"] = ""
     output_df.loc[salary_mask, "Level_6"] = salary_entity.loc[salary_mask]
@@ -1155,20 +1246,20 @@ USER_INITIATED_RE = re.compile(
 
 
 def apply_strict_level2(df: pd.DataFrame) -> pd.DataFrame:
-    """Assign initiation mode only when narration has explicit evidence."""
+    """Assign a complete, rule-based initiation mode to every transaction."""
     output_df = df.copy()
-    output_df["Level_2"] = ""
+    output_df["Level_2"] = "User-generated"
 
     for idx, row in output_df.iterrows():
         particulars = str(row.get("Particulars", "") or "").strip()
 
-        # Automated payment evidence takes precedence.
+        # Explicit automated-payment evidence takes priority.
         if SYSTEM_INITIATED_RE.search(particulars):
             output_df.at[idx, "Level_2"] = "System generated"
 
-        # Only explicit, recognizable user-initiated transaction markers.
-        elif USER_INITIATED_RE.search(particulars):
-            output_df.at[idx, "Level_2"] = "User-generated"
+        # Salary credits identified by the existing salary-detection pipeline.
+        elif row.get("IsSalary", 0) == 1:
+            output_df.at[idx, "Level_2"] = "System generated"
 
     return output_df
 

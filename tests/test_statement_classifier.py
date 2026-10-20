@@ -229,6 +229,35 @@ def test_pipeline_salary_credit_is_still_classified_as_salary():
     assert out.loc[0, "Level_5"] == "salary"
     assert out.loc[0, "First Level Classification"] == "Salary"
     assert out.loc[0, "Level_0"] == "credit"
+    # Level_3 is deliberately not asserted: salary purpose alone does not
+    # establish the counterparty type.
+
+
+def test_salary_credit_does_not_overwrite_existing_level3():
+    classifier = make_classifier(
+        {
+            "SALARY": {"Level_5": "salary"},
+            "RAHUL": {"Level_3": "p2p"},
+        }
+    )
+    df = statement_frame(
+        [
+            {
+                "Date": "2026-03-05",
+                "Particulars": "SALARY MARCH RAHUL",
+                "Debit": "",
+                "Credit": 55000,
+                "Part_0": "SALARY",
+                "Part_1": "RAHUL",
+            }
+        ]
+    )
+
+    out = classifier.classify(df)
+
+    assert out.loc[0, "IsSalary"] == 1
+    assert out.loc[0, "Level_5"] == "salary"
+    assert out.loc[0, "Level_3"] == "p2p"
 
 
 # ------------------------------------------------------------------- ATM ----
@@ -699,7 +728,7 @@ def test_ambiguous_slash_upi_is_not_confidently_labelled_p2p():
     assert result["Level_5"] == ""
 
 
-def test_ach_credit_is_institution_not_p2p():
+def test_ach_credit_does_not_force_institution_counterparty():
     result = blank_levels()
     result.update({
         "Level_3": "p2p",
@@ -713,11 +742,12 @@ def test_ach_credit_is_institution_not_p2p():
         credit_value=1000,
     )
 
-    assert result["Level_3"] == "institution"
+    # ACH alone must not overwrite the counterparty type.
+    assert result["Level_3"] == "p2p"
     assert result["Level_5"] == "dividend"
 
 
-def test_autopay_debit_is_not_p2p():
+def test_autopay_debit_does_not_force_institution_counterparty():
     result = blank_levels()
     result.update({
         "Level_3": "p2p",
@@ -731,7 +761,8 @@ def test_autopay_debit_is_not_p2p():
         credit_value=0,
     )
 
-    assert result["Level_3"] == "institution"
+    # Automation alone must not overwrite the counterparty type.
+    assert result["Level_3"] == "p2p"
     assert result["Level_5"] == ""
 
 
@@ -747,3 +778,22 @@ def test_strict_level2_recognizes_ach_and_autopay():
 
     assert result.loc[0, "Level_2"] == "System generated"
     assert result.loc[1, "Level_2"] == "System generated"
+
+
+def test_strict_level2_defaults_ordinary_transactions_to_user_generated():
+    df = pd.DataFrame({
+        "Particulars": [
+            "LOCAL SHOP PAYMENT",
+            "NEFT TRANSFER TO FRIEND",
+            "ATM CASH WITHDRAWAL",
+        ],
+        "IsSalary": [0, 0, 0],
+    })
+
+    result = apply_strict_level2(df)
+
+    assert result["Level_2"].tolist() == [
+        "User-generated",
+        "User-generated",
+        "User-generated",
+    ]
