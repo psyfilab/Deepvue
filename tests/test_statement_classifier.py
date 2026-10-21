@@ -797,3 +797,415 @@ def test_strict_level2_defaults_ordinary_transactions_to_user_generated():
         "User-generated",
         "User-generated",
     ]
+
+
+# =============================================================================
+# Level 5 category classification – regression tests
+# =============================================================================
+
+from src.statement_classifier import (  # noqa: E402
+    NARRATION_LEVEL5_PATTERNS,
+    apply_narration_purpose_override,
+)
+
+
+def _level5(particulars: str, debit=0, credit=0, preset_level5="") -> str:
+    """Helper: run apply_narration_purpose_override and return Level 5."""
+    result = blank_levels()
+    result["Level_5"] = preset_level5
+    out = apply_narration_purpose_override(
+        particulars,
+        result,
+        debit_value=debit if debit else None,
+        credit_value=credit if credit else None,
+    )
+    return out["Level_5"]
+
+
+# ─── narration_purpose_override never overwrites an existing Level 5 ─────────
+
+
+def test_existing_level5_is_preserved():
+    """apply_narration_purpose_override must not overwrite an already-set value."""
+    assert _level5("ZOMATO PAYMENT", debit=500, preset_level5="retail") == "retail"
+    assert _level5("HOTEL SELECT PAYMENT", debit=3000, preset_level5="services") == "services"
+
+
+# ─── ATM cash rows are untouched ──────────────────────────────────────────────
+
+
+def test_atm_row_level5_not_set_by_narration_override():
+    """apply_narration_purpose_override skips cash (ATM) rows."""
+    result = blank_levels()
+    result["Level_1"] = "cash"
+    out = apply_narration_purpose_override("ATW-512345XXXXXX6789-HYDERABAD", result, debit_value=5000)
+    assert out["Level_5"] == ""
+
+
+# ─── Dining ───────────────────────────────────────────────────────────────────
+
+
+@pytest.mark.parametrize(
+    "narration",
+    [
+        "ZOMATO FOOD DELIVERY",
+        "SWIGGY ORDER PAYMENT",
+        "HOTEL SELECT DINING",
+        "SARAVANA BHAVA HOTEL",
+        "ATITHI DHABA AND CATERERS",
+        "PESHAWAR RESTAURANT PAYMENT",
+        "BURGER KING ORDER",
+        "FROZEN BOTTLE PAYMENT",
+        "DYU ART CAFE",
+        "UPI/DR/123/PIZZAHUT/HDFC/pizza@hdfc",
+    ],
+)
+def test_narration_purpose_dining(narration):
+    assert _level5(narration, debit=500) == "dining"
+
+
+# ─── Grocery ──────────────────────────────────────────────────────────────────
+
+
+@pytest.mark.parametrize(
+    "narration",
+    [
+        "BLINKIT GROCERY ORDER",
+        "ZEPTO FRESH DELIVERY",
+        "BIGBASKET WEEKLY GROCERIES",
+        "JIOMART KIRANA PURCHASE",
+        "SWIGGY INSTAMART PAYMENT",
+    ],
+)
+def test_narration_purpose_grocery(narration):
+    assert _level5(narration, debit=800) == "grocery"
+
+
+# ─── Fuel ─────────────────────────────────────────────────────────────────────
+
+
+@pytest.mark.parametrize(
+    "narration",
+    [
+        "HPCL PETROL PUMP PAYMENT",
+        "IOCL FUEL STATION",
+        "BPCL PETROL PURCHASE",
+        "UPI/DR/123/PETROL PUMP/HDFC/fuel@hdfc",
+    ],
+)
+def test_narration_purpose_fuel(narration):
+    assert _level5(narration, debit=2000) == "fuel"
+
+
+# ─── Travel ───────────────────────────────────────────────────────────────────
+
+
+@pytest.mark.parametrize(
+    "narration",
+    [
+        "MAKEMYTRIP FLIGHT BOOKING",
+        "GOIBIBO HOTEL BOOKING",
+        "OYO ROOMS HOTEL STAY",
+        "CLEARTRIP AIRLINE TICKET",
+        "YATRA TOUR PACKAGE",
+    ],
+)
+def test_narration_purpose_travel(narration):
+    assert _level5(narration, debit=5000) == "travel"
+
+
+# ─── Transport ────────────────────────────────────────────────────────────────
+
+
+@pytest.mark.parametrize(
+    "narration",
+    [
+        "UBER INDIA RIDES PAYMENT",
+        "OLA CABS TRIP",
+        "RAPIDO BIKE TAXI",
+        "IRCTC RAIL TICKET BOOKING",
+        "WTI CABS PAYMENT",
+    ],
+)
+def test_narration_purpose_transport(narration):
+    assert _level5(narration, debit=300) == "transport"
+
+
+# ─── Pharmacy ─────────────────────────────────────────────────────────────────
+
+
+@pytest.mark.parametrize(
+    "narration",
+    [
+        "PHARMEASY MEDICINE ORDER",
+        "MEDPLUS PHARMACY",
+        "NETMEDS ONLINE PHARMACY",
+        "APOLLO PHARMACY PURCHASE",
+        "AYURVEDA KENDRA PAYMENT",
+        "PREET MEDICOS GENERAL STORE",
+        "SUPRABHO MEDI STORE",
+        "ARUL MEDICALS",
+    ],
+)
+def test_narration_purpose_pharmacy(narration):
+    assert _level5(narration, debit=500) in {"pharmacy", "healthcare"}
+
+
+# ─── Healthcare ───────────────────────────────────────────────────────────────
+
+
+@pytest.mark.parametrize(
+    "narration",
+    [
+        "APOLLO HOSPITAL PAYMENT",
+        "DELFINIUM FERTILITY CLINIC",
+        "PATH LAB DIAGNOSTIC CENTRE",
+        "AGS MEDICARE PRIVATE",
+        "MS SON X MEDICAL CENTER",
+    ],
+)
+def test_narration_purpose_healthcare(narration):
+    assert _level5(narration, debit=1500) in {"healthcare", "pharmacy"}
+
+
+# ─── Loan repayment ───────────────────────────────────────────────────────────
+
+
+@pytest.mark.parametrize(
+    "narration",
+    [
+        "HDFC BANK HOME LOAN EMI",
+        "SBI PERSONAL LOAN REPAYMENT",
+        "ICICI BANK CAR LOAN EMI",
+        "EDUCATION LOAN INSTALLMENT",
+        "LOAN RECOVERY DEBIT",
+    ],
+)
+def test_narration_purpose_loan_repayment(narration):
+    assert _level5(narration, debit=15000) == "loan repayment"
+
+
+# ─── Credit card payment ──────────────────────────────────────────────────────
+
+
+def test_narration_purpose_credit_card_debit():
+    """A credit-card bill payment is a debit."""
+    assert _level5("HDFC CREDIT CARD PAYMENT", debit=12000) == "credit card"
+
+
+def test_narration_purpose_credit_card_credit_ignored():
+    """A credit from a credit-card issuer is not a bill payment."""
+    assert _level5("ICICI CREDIT CARD CASHBACK", credit=500) != "credit card"
+
+
+# ─── Insurance ────────────────────────────────────────────────────────────────
+
+
+@pytest.mark.parametrize(
+    "narration",
+    [
+        "LIC PREMIUM PAYMENT",
+        "ACKO HEALTH INSURANCE",
+        "STAR HEALTH INSURANCE PREMIUM",
+        "BAJAJ ALLIANZ POLICY PREMIUM",
+        "HDFC ERGO INSURANCE",
+    ],
+)
+def test_narration_purpose_insurance(narration):
+    assert _level5(narration, debit=5000) == "insurance"
+
+
+# ─── Utilities ────────────────────────────────────────────────────────────────
+
+
+@pytest.mark.parametrize(
+    "narration",
+    [
+        "MSEB ELECTRICITY BILL PAYMENT",
+        "BESCOM ELECTRIC BILL",
+        "MAHANAGAR GAS BILL",
+        "BROADBAND INTERNET BILL PAYMENT",
+        "DTH BILL PAYMENT",
+    ],
+)
+def test_narration_purpose_utilities(narration):
+    assert _level5(narration, debit=1200) == "utilities"
+
+
+# ─── Mobile recharge ──────────────────────────────────────────────────────────
+
+
+def test_narration_purpose_mobile_recharge():
+    assert _level5("AIRTEL PREPAID RECHARGE", debit=299) == "mobile recharge"
+    assert _level5("JIO TOPUP PAYMENT", debit=199) == "mobile recharge"
+
+
+# ─── Subscription / OTT ───────────────────────────────────────────────────────
+
+
+@pytest.mark.parametrize(
+    "narration",
+    [
+        "NETFLIX MONTHLY SUBSCRIPTION",
+        "SPOTIFY PREMIUM PLAN",
+        "HOTSTAR ANNUAL PLAN",
+        "BOOKMYSHOW SUBSCRIPTION",
+    ],
+)
+def test_narration_purpose_subscription(narration):
+    assert _level5(narration, debit=199) == "subscription"
+
+
+# ─── Education ────────────────────────────────────────────────────────────────
+
+
+def test_narration_purpose_education():
+    assert _level5("BYJU'S COURSE FEE PAYMENT", debit=2000) == "education"
+    assert _level5("SCHOOL FEE PAYMENT", debit=3500) == "education"
+    assert _level5("COLLEGE TUITION FEE", debit=25000) == "education"
+
+
+# ─── Financial services / investments ────────────────────────────────────────
+
+
+@pytest.mark.parametrize(
+    "narration",
+    [
+        "GROWW SIP PAYMENT",
+        "ZERODHA MUTUAL FUND INVESTMENT",
+        "UPSTOX DEMAT ACCOUNT",
+        "NPS CONTRIBUTION PAYMENT",
+    ],
+)
+def test_narration_purpose_financial_services(narration):
+    assert _level5(narration, debit=5000) == "financial services"
+
+
+# ─── Salary direction guard ───────────────────────────────────────────────────
+
+
+def test_narration_salary_not_set_on_debit():
+    """Salary is income — a debit narration with 'SALARY' must not get salary."""
+    assert _level5("SALARY ADVANCE RECOVERY", debit=25000) != "salary"
+
+
+def test_narration_salary_set_on_credit():
+    """An explicit credit salary narration should get salary purpose."""
+    assert _level5("NEFT SALARY ACME CORP", credit=50000) == "salary"
+
+
+# ─── Retail ───────────────────────────────────────────────────────────────────
+
+
+@pytest.mark.parametrize(
+    "narration",
+    [
+        "AMAZON PURCHASE PAYMENT",
+        "FLIPKART ORDER",
+        "MYNTRA FASHION ORDER",
+        "NYKAA BEAUTY PRODUCTS",
+        "DECATHLON SPORTS STORE",
+    ],
+)
+def test_narration_purpose_retail(narration):
+    assert _level5(narration, debit=999) == "retail"
+
+
+# ─── Ambiguous tokens do not generate false positives ─────────────────────────
+
+
+def test_ambiguous_narration_stays_blank():
+    """Generic payment narrations without category evidence stay blank."""
+    assert _level5("NEFT TRANSFER TO FRIEND", debit=5000) == ""
+    assert _level5("UPI PAYMENT", debit=100) == ""
+
+
+def test_gas_station_narration_is_fuel_not_utilities():
+    """Gas station payment should be fuel, not utilities (ordered priority)."""
+    assert _level5("IOCL GAS STATION PAYMENT", debit=1500) == "fuel"
+
+
+# ─── Pipeline integration ─────────────────────────────────────────────────────
+
+
+def test_pipeline_dining_merchant_gets_level5():
+    """A merchant-classified restaurant row should get dining as Level 5."""
+    rows = [
+        {
+            "Date": "2026-04-01",
+            "Particulars": "HOTEL SELECT DINING PAYMENT",
+            "Debit": 800,
+            "Credit": "",
+            "Part_0": "HOTEL",
+            "Part_1": "SELECT",
+        }
+    ]
+    out = make_classifier().classify(statement_frame(rows))
+    assert out.loc[0, "Level_5"] == "dining"
+
+
+def test_pipeline_grocery_merchant_gets_level5():
+    """Blinkit row should get grocery as Level 5."""
+    rows = [
+        {
+            "Date": "2026-04-01",
+            "Particulars": "BLINKIT GROCERY DELIVERY PAYMENT",
+            "Debit": 450,
+            "Credit": "",
+            "Part_0": "BLINKIT",
+            "Part_1": "GROCERY",
+        }
+    ]
+    out = make_classifier().classify(statement_frame(rows))
+    assert out.loc[0, "Level_5"] == "grocery"
+
+
+def test_pipeline_loan_emi_narration_gets_level5():
+    """Explicit loan EMI narration should get loan repayment Level 5."""
+    rows = [
+        {
+            "Date": "2026-04-01",
+            "Particulars": "HDFC BANK HOME LOAN EMI",
+            "Debit": 25000,
+            "Credit": "",
+            "Part_0": "HDFC",
+            "Part_1": "BANK",
+        }
+    ]
+    out = make_classifier().classify(statement_frame(rows))
+    assert out.loc[0, "Level_5"] == "loan repayment"
+
+
+def test_pipeline_keyword_level5_beats_narration_override():
+    """If keyword model already set Level 5, narration override must not overwrite it."""
+    canned = {"UBER": {"Level_5": "digital services", "Level_3": "merchant"}}
+    rows = [
+        {
+            "Date": "2026-04-01",
+            "Particulars": "UBER INDIA RIDES PAYMENT",
+            "Debit": 350,
+            "Credit": "",
+            "Part_0": "UBER",
+        }
+    ]
+    out = make_classifier(canned).classify(statement_frame(rows))
+    # Keyword model said "digital services"; narration says "transport".
+    # Keyword model wins.
+    assert out.loc[0, "Level_5"] == "digital services"
+
+
+def test_pipeline_existing_level5_unchanged_without_narration_evidence():
+    """Rows with no purpose evidence in the narration keep Level 5 blank."""
+    rows = [
+        {
+            "Date": "2026-04-01",
+            "Particulars": "IMPS PAYMENT REF 123456",
+            "Debit": 5000,
+            "Credit": "",
+            "Part_0": "IMPS",
+            "Part_1": "PAYMENT",
+        }
+    ]
+    out = make_classifier().classify(statement_frame(rows))
+    # No specific category evidence — Level 5 should remain blank.
+    assert out.loc[0, "Level_5"] == ""

@@ -148,6 +148,49 @@ MERCHANT_DEFAULT_PURPOSES = {
     "flipkart": "retail",
     "zomato": "dining",
     "swiggy": "dining",
+    "blinkit": "grocery",
+    "zepto": "grocery",
+    "bigbasket": "grocery",
+    "grofers": "grocery",
+    "jiomart": "grocery",
+    "instamart": "grocery",
+    "irctc": "transport",
+    "uber": "transport",
+    "ola": "transport",
+    "rapido": "transport",
+    "olacabs": "transport",
+    "pharmeasy": "pharmacy",
+    "netmeds": "pharmacy",
+    "medplus": "pharmacy",
+    "apollo": "healthcare",
+    "1mg": "pharmacy",
+    "netflix": "subscription",
+    "spotify": "subscription",
+    "hotstar": "subscription",
+    "primevideo": "subscription",
+    "youtube": "subscription",
+    "bookmyshow": "entertainment",
+    "myntra": "retail",
+    "meesho": "retail",
+    "ajio": "retail",
+    "nykaa": "retail",
+    "makemytrip": "travel",
+    "goibibo": "travel",
+    "yatra": "travel",
+    "cleartrip": "travel",
+    "ixigo": "travel",
+    "indigo": "travel",
+    "spicejet": "travel",
+    "airindia": "travel",
+    "oyo": "travel",
+    "airbnb": "travel",
+    "groww": "financial services",
+    "zerodha": "financial services",
+    "upstox": "financial services",
+    "kuvera": "financial services",
+    "smallcase": "financial services",
+    "paytmmoney": "financial services",
+    "mirae": "financial services",
 }
 # Hyphen-delimited UPI narrations, e.g. "UPI-<payee>-<vpa>@<psp>-<ifsc>-<ref>-<note>".
 HYPHEN_UPI_RE = re.compile(r"^\s*UPI\s*-", flags=re.IGNORECASE)
@@ -520,6 +563,261 @@ def detect_level_4_platform_or_bank(text: str) -> str:
     return ""
 
 
+# ---------------------------------------------------------------------------
+# Narration-level Level 5 purpose inference
+# ---------------------------------------------------------------------------
+# These patterns run on the *full narration* (Particulars), which typically
+# contains more evidence than any single keyword part.  They are applied only
+# when Level 5 is blank after all keyword-model and structured-UPI overrides.
+# Order matters: more specific patterns come before broader ones that share
+# keywords.  Labels reuse the ALLOWED_PURPOSES vocabulary from prompt_part3.py.
+NARRATION_LEVEL5_PATTERNS: list[tuple[re.Pattern[str], str]] = [
+    # Credit-card bill payment (must beat generic "loan repayment" rule)
+    (
+        re.compile(
+            r"\b(?:credit\s*card|cc\s*bill|ccbp|ccpmt|cc\s*payment|card\s*payment"
+            r"|hdfc\s*cc|icici\s*cc|axis\s*cc|sbi\s*cc|kotak\s*cc)\b",
+            re.IGNORECASE,
+        ),
+        "credit card",
+    ),
+    # Loan / EMI repayment
+    (
+        re.compile(
+            r"\b(?:emi|loan\s*repay|loan\s*emi|home\s*loan|personal\s*loan"
+            r"|car\s*loan|auto\s*loan|education\s*loan|loan\s*instal+ment"
+            r"|equated\s*monthly|loan\s*recovery|ecs\s*emi)\b",
+            re.IGNORECASE,
+        ),
+        "loan repayment",
+    ),
+    # Insurance premium
+    (
+        re.compile(
+            r"\b(?:insurance|insur|policy\s*premium|premium\s*payment"
+            r"|lic\s*premium|\blic\b|acko|ergo|bupa|niva\s*bupa|star\s*health"
+            r"|icici\s*lombard|hdfc\s*ergo|bajaj\s*allianz|new\s*india\s*assurance)\b",
+            re.IGNORECASE,
+        ),
+        "insurance",
+    ),
+    # Salary / payroll (applied only to credits — guarded at call site)
+    (
+        re.compile(
+            r"\b(?:salary|payroll|wages|\bsal\b|payslip)\b",
+            re.IGNORECASE,
+        ),
+        "salary",
+    ),
+    # Tax payments
+    (
+        re.compile(
+            r"\b(?:income\s*tax|advance\s*tax|tds\s*payment|gst\s*payment"
+            r"|itdtax|stax|tax\s*payment)\b",
+            re.IGNORECASE,
+        ),
+        "tax",
+    ),
+    # Mobile / DTH recharge (recharge keyword only; dth recharge belongs to utilities)
+    (
+        re.compile(
+            r"\b(?:topup|top\s*up|prepaid\s*recharge|mobile\s*recharge"
+            r"|sim\s*recharge)\b"
+            r"|\brecharge\b(?!.*\b(?:dth|dish\s*tv|tata\s*sky|d2h|videocon\s*d2h)\b)",
+            re.IGNORECASE,
+        ),
+        "mobile recharge",
+    ),
+    # Utilities & bills (electricity, gas, broadband, DTH including DTH recharge)
+    (
+        re.compile(
+            r"\b(?:electricity|electric\s*bill|water\s*bill|gas\s*bill|lpg"
+            r"|broadband|internet\s*bill|wifi\s*bill|dth\s*(?:bill|recharge)|utility"
+            r"|piped\s*gas|png\s*bill|mseb|bescom|bses|torrent\s*power"
+            r"|adani\s*gas|mahanagar\s*gas|indraprastha\s*gas)\b",
+            re.IGNORECASE,
+        ),
+        "utilities",
+    ),
+    # Pharmacy / medicine — before dining/healthcare to prevent cafe/health-bar overlap
+    (
+        re.compile(
+            r"\b(?:pharmacy|pharma|medicos?|medicals?|medi\s*store|chemist|drugstore"
+            r"|pharmeasy|medplus|netmeds|1mg|apollopharmacy|lenskar"
+            r"|ayurveda\s*kendra|ayurved|homeopath|ayurvedic)\b",
+            re.IGNORECASE,
+        ),
+        "pharmacy",
+    ),
+    # Healthcare (hospitals, clinics — distinct from pharmacy)
+    (
+        re.compile(
+            r"\b(?:hospital|clinic|medicare|healthcare|diagnostic"
+            r"|pathlab|path\s*lab|ivf|fertility|nursing\s*home|medical\s*centre"
+            r"|medical\s*center|dental|dentist|optician|optical|eye\s*care"
+            r"|ags\s*medicare|ms\s*son\s*x\s*medical)\b",
+            re.IGNORECASE,
+        ),
+        "healthcare",
+    ),
+    # Grocery — placed BEFORE dining so "Swiggy Instamart" hits grocery not dining
+    (
+        re.compile(
+            r"\b(?:grocery|groceries|blinkit|zepto|bigbasket|grofers"
+            r"|jiomart|instamart|swiggy\s*instamart|supermarket|kirana|fresh\s*mart|sabji"
+            r"|vegetable|fruit\s*shop|daily\s*needs|ever\s*green\s*fresh"
+            r"|milk\s*booth|dairy|sorabh\s*dairy)\b",
+            re.IGNORECASE,
+        ),
+        "grocery",
+    ),
+    # Dining / food — placed after grocery
+    (
+        re.compile(
+            r"\b(?:restaurant|zomato|swiggy|cafe|dhaba|food\s*court"
+            r"|pizza|burger|kfc|mcdonalds|dominos?|biryani|diner"
+            r"|bakery|confectionery|sweet\s*shop|juice\s*bar|tea\s*stall"
+            r"|mess|canteen|tiffin|bar\s*and\s*grill"
+            r"|jubilant\s*food|saravana\s*bhava|dyu\s*art|frozen\s*bottle"
+            r"|atithi\s*dhaba|peshawar\s*restaurant|burger\s*king)\b"
+            r"|\bhotel\b(?!\s*(?:booking|stay|accommodation|reservation|check))",
+            re.IGNORECASE,
+        ),
+        "dining",
+    ),
+    # Fuel / petrol
+    (
+        re.compile(
+            r"\b(?:petrol|diesel|fuel|hpcl|iocl|bpcl|hp\s*petrol"
+            r"|cng\s*station|gas\s*station|shell|petrol\s*pump"
+            r"|fuel\s*station|bharat\s*petroleum|indian\s*oil)\b",
+            re.IGNORECASE,
+        ),
+        "fuel",
+    ),
+    # Travel / flight / accommodation bookings
+    (
+        re.compile(
+            r"\b(?:makemytrip|mmt|goibibo|yatra|cleartrip|ixigo"
+            r"|spicejet|air\s*india|vistara|akasa|go\s*first|air\s*asia"
+            r"|hotel\s*booking|hotel\s*stay|oyo\s*room|airbnb"
+            r"|flight\s*ticket|airline\s*ticket|holiday\s*package|tour\s*package)\b",
+            re.IGNORECASE,
+        ),
+        "travel",
+    ),
+    # Transport / ride-hailing / metro / railways
+    (
+        re.compile(
+            r"\b(?:uber|olacabs|ola\s*cabs?|rapido|irctc|indian\s*rail"
+            r"|metro\s*card|metro\s*rail|city\s*bus|pmpml|msrtc|dtc\s*bus"
+            r"|cab\s*service|taxi|airport\s*transfer|wti\s*cabs?)\b",
+            re.IGNORECASE,
+        ),
+        "transport",
+    ),
+    # Education / school / college fees
+    (
+        re.compile(
+            r"\b(?:school\s*fee|college\s*fee|tuition|tuition\s*fee"
+            r"|university\s*fee|course\s*fee|coaching|byju|unacademy|vedantu"
+            r"|education\s*fee|exam\s*fee|admission\s*fee)\b",
+            re.IGNORECASE,
+        ),
+        "education",
+    ),
+    # Investments / SIP / mutual funds
+    (
+        re.compile(
+            r"\b(?:groww|zerodha|upstox|kuvera|smallcase|paytm\s*money"
+            r"|mutual\s*fund|sip\s*payment|sip\s*debit|nps\s*contribution"
+            r"|demat|ppf\s*deposit|fd\s*deposit|rd\s*deposit|investment)\b",
+            re.IGNORECASE,
+        ),
+        "financial services",
+    ),
+    # Subscriptions / streaming / OTT
+    (
+        re.compile(
+            r"\b(?:netflix|spotify|hotstar|primevideo|youtube\s*premium"
+            r"|jiocinema|zee5|sonyliv|voot|mxplayer|bookmyshow"
+            r"|subscription|annual\s*plan)\b",
+            re.IGNORECASE,
+        ),
+        "subscription",
+    ),
+    # Retail / shopping (broad — after more specific retail sub-categories above)
+    (
+        re.compile(
+            r"\b(?:amazon|flipkart|myntra|meesho|ajio|nykaa|snapdeal"
+            r"|reliance\s*digital|croma|vijay\s*sales|decathlon"
+            r"|shoppers\s*stop|lifestyle|westside|max\s*fashion"
+            r"|big\s*bazar|dmart|ansari\s*clothes)\b",
+            re.IGNORECASE,
+        ),
+        "retail",
+    ),
+    # Digital services / payment platforms as last resort
+    (
+        re.compile(
+            r"\b(?:paytm|gpay|google\s*pay|phonepe|razorpay|cashfree"
+            r"|freecharge|payu|bharatpe|billdesk|juspay|mobikwik)\b",
+            re.IGNORECASE,
+        ),
+        "digital services",
+    ),
+]
+
+
+def apply_narration_purpose_override(
+    particulars: str,
+    result: dict[str, str],
+    debit_value: object = None,
+    credit_value: object = None,
+    part_texts: list[str] | None = None,
+) -> dict[str, str]:
+    """Fill a blank Level 5 purpose from the full narration when the keyword
+    model left it empty.
+
+    This is the last-resort fill pass: it only ever writes into a *blank*
+    Level 5 and never overwrites a value set by the keyword model or any
+    earlier override.  It applies ordered regex patterns to the full narration
+    (which contains more context than any individual keyword part).
+
+    Direction awareness:
+    - ``salary`` is only applied to credit rows.
+    - ``credit card`` (bill payment) is only applied to debit rows.
+    - All other categories apply regardless of direction.
+    """
+
+    # Nothing to do if Level 5 is already set.
+    if result.get("Level_5"):
+        return result
+
+    # ATM withdrawals are already handled by apply_atm_withdrawal_overrides.
+    if result.get("Level_1") == "cash":
+        return result
+
+    text = _marker_text(particulars, part_texts)
+    direction = derive_direction_from_amounts(debit_value, credit_value)
+
+    for pattern, purpose in NARRATION_LEVEL5_PATTERNS:
+        if not pattern.search(text):
+            continue
+
+        # salary is income — only on credits
+        if purpose == "salary" and direction == "debit":
+            continue
+        # credit card *bill payment* — only on debits
+        if purpose == "credit card" and direction == "credit":
+            continue
+
+        result["Level_5"] = purpose
+        break  # First match wins; patterns ordered by specificity.
+
+    return result
+
+
 def parse_amount(value: object) -> float:
     """Convert a debit or credit cell into a positive float."""
 
@@ -544,6 +842,99 @@ def _normalize_compare(value: str) -> str:
     """Normalize a label for duplicate checks."""
 
     return "" if value is None else str(value).strip().lower()
+
+
+# Level 6 holds the specific payee/payer/brand. These words describe the
+# transaction (narration prefixes, rails, bill types), not an entity.
+GENERIC_LEVEL6_WORDS = frozenset(
+    {
+        "to", "by", "from", "for", "via", "bill", "bills", "payment", "payments",
+        "pay", "payme", "transfer", "transfers", "trf", "neft", "imps", "rtgs",
+        "upi", "atm", "wdl", "withdrawal", "cash", "merchant", "dr", "cr", "bbps",
+        "ach", "nach", "ecs", "clearing", "deposit", "chq", "cheque", "issued",
+        "recvd", "clrd", "bouncd", "pdc", "intl", "ref", "credit", "debit", "card",
+        "recharge", "mobile", "premium", "insurance", "electricity", "broadband",
+        "dth", "online", "txn", "transaction",
+    }
+)
+# Structured slash narrations: <RAIL>/<DR|CR>/<ref>/<NAME>/<BANK>/..., where the
+# reference may sit before or after DR/CR (e.g. "UPI/449682688795/DR/ARUN/SBIN").
+SLASH_ENTITY_RAIL_RE = re.compile(r"\b(UPI|NEFT|IMPS|RTGS|ATM)/(.*)", flags=re.IGNORECASE)
+# BBPS biller id, e.g. "BBPS/DR/HDFCCC2025030457/CREDIT CARD BILL/".
+BBPS_BILLER_RE = re.compile(r"\bBBPS/(?:DR|CR)/([A-Z][A-Z ]*[A-Z])\d", flags=re.IGNORECASE)
+BBPS_BILLER_NAMES = {"jiofiber": "jio fiber", "tatasky": "tata sky"}
+
+
+def is_generic_level6(value: str) -> bool:
+    """Return True when a Level 6 value names no entity (e.g. "to bill payment")."""
+
+    text = _normalize_compare(value)
+    if len(re.sub(r"[^a-z]", "", text)) < 3:
+        return True
+    return all(token in GENERIC_LEVEL6_WORDS for token in re.findall(r"[a-z0-9]+", text))
+
+
+def extract_narration_entity(particulars: str) -> str:
+    """Return the payee/payer/biller explicitly named by a structured narration.
+
+    Handles slash narrations (UPI/NEFT/IMPS/RTGS/ATM: the first segment after
+    DR/CR that is not a reference number) and BBPS biller ids ("LIC2025...",
+    "HDFCCC2025..." -> "hdfc credit card"). Returns "" when the narration does
+    not identify an entity, so callers keep their existing fallback.
+    """
+
+    text = str(particulars or "")
+
+    biller = BBPS_BILLER_RE.search(text)
+    if biller:
+        code = re.sub(r"\s+", " ", biller.group(1)).strip().lower()
+        if code.endswith("cc") and any(code[:-2] in aliases for aliases in BANK_ALIASES.values()):
+            return f"{code[:-2]} credit card"
+        return BBPS_BILLER_NAMES.get(code, code)
+
+    rail = SLASH_ENTITY_RAIL_RE.search(text)
+    if not rail:
+        return ""
+    segments = [segment.strip() for segment in rail.group(2).split("/")]
+    direction_index = next(
+        (index for index, segment in enumerate(segments) if segment.upper() in {"DR", "CR"}),
+        None,
+    )
+    if direction_index is None:
+        return ""
+    for segment in segments[direction_index + 1 :]:
+        if re.search(r"\d{5,}", segment):  # transaction / NEFT reference
+            continue
+        name = re.sub(r"\s+", " ", segment).strip().lower()
+        if name and not is_generic_level6(name):
+            return name
+        return ""
+    return ""
+
+
+def fill_specific_level6(particulars: str, result: dict[str, str]) -> dict[str, str]:
+    """Replace a blank, generic or category Level 6 with the narration's entity.
+
+    A specific Level 6 is never changed. When the narration names no entity,
+    the existing value is kept, except that a copy of the Level 5 category is
+    removed because a category is not an entity.
+    """
+
+    current = result.get("Level_6", "")
+    is_category = bool(current) and _normalize_compare(current) == _normalize_compare(result.get("Level_5", ""))
+    biller = BBPS_BILLER_RE.search(str(particulars or ""))
+    # A raw copy of the BBPS biller code ("hdfccc") is replaced by its readable form.
+    is_raw_biller_code = bool(biller) and re.sub(r"[^a-z0-9]", "", _normalize_compare(current)) == re.sub(
+        r"[^a-z0-9]", "", biller.group(1).lower()
+    )
+    if current and not is_category and not is_raw_biller_code and not is_generic_level6(current):
+        return result
+    entity = extract_narration_entity(particulars)
+    if entity:
+        result["Level_6"] = entity
+    elif is_category:
+        result["Level_6"] = ""
+    return result
 
 
 def derive_direction_from_amounts(debit_value: object, credit_value: object) -> str:
@@ -604,6 +995,20 @@ def aggregate_part_predictions(
             level_name = f"Level_{level_index}"
             if not result[level_name] and prediction.get(level_name):
                 result[level_name] = prediction[level_name]
+
+    # Level 6: the first part is usually the narration prefix ("TO TRANSFER",
+    # "TO BILL PAYMENT"), so prefer the first specific entity from any part and
+    # keep the first generic value only when no part names an entity.
+    specific_level6 = next(
+        (
+            prediction["Level_6"]
+            for _, prediction in part_predictions
+            if prediction.get("Level_6") and not is_generic_level6(prediction["Level_6"])
+        ),
+        "",
+    )
+    if specific_level6:
+        result["Level_6"] = specific_level6
 
     # Level 4 precedence: a payment intermediary predicted for any part wins
     # over a bank predicted for an earlier part.
@@ -899,9 +1304,13 @@ def apply_raw_transaction_overrides(
 
     # Salary is income and must not be inferred from a debit.
     if SALARY_KEYWORDS.search(text) and not is_debit:
-        entity = SALARY_KEYWORDS.sub("", text)
-        entity = re.sub(r"[\-/|]+", " ", entity)
-        entity = re.sub(r"\s+", " ", entity).strip().lower()
+        # Prefer the payer named by a structured narration ("NISHA MA");
+        # otherwise keep the existing cleaned-narration fallback.
+        entity = extract_narration_entity(text)
+        if not entity:
+            entity = SALARY_KEYWORDS.sub("", text)
+            entity = re.sub(r"[\-/|]+", " ", entity)
+            entity = re.sub(r"\s+", " ", entity).strip().lower()
 
         # Salary purpose does not establish counterparty type.
         result["Level_5"] = "salary"
@@ -937,6 +1346,10 @@ def apply_raw_transaction_overrides(
         if result.get("Level_5") == "p2p transfer":
             result["Level_5"] = ""
 
+    # Level 6: replace a generic label ("to transfer", "to bill payment") with
+    # the payee/biller the narration names, if it names one.
+    fill_specific_level6(text, result)
+
     # Do not let the p2p default re-add a purpose the automated-debit rule cleared.
     return _apply_transaction_rules(result, default_p2p_purpose=not automated_debit)
 
@@ -971,8 +1384,16 @@ def apply_atm_withdrawal_overrides(
     for _, prediction in part_predictions:
         if not bank_name and prediction.get("Level_4"):
             bank_name = prediction["Level_4"]
-        if not location and prediction.get("Level_6") and prediction.get("Level_3") != "p2p":
+        if (
+            (not location or is_generic_level6(location))
+            and prediction.get("Level_6")
+            and not is_generic_level6(prediction["Level_6"])
+            and prediction.get("Level_3") != "p2p"
+        ):
             location = prediction["Level_6"]
+    if not location or is_generic_level6(location):
+        # e.g. "ATM/DR/729425/ICICI BANK ATM/..." names the ATM itself.
+        location = extract_narration_entity(particulars) or location
 
     result["Level_1"] = "cash"
     # An ATM withdrawal is a cash transaction, not a P2P/merchant payment or
@@ -1201,7 +1622,11 @@ def detect_salary(df: pd.DataFrame) -> pd.DataFrame:
     output_df.loc[debit_mask, "SalaryConfidence"] = 0.0
 
     salary_mask = output_df["IsSalary"].eq(1)
-    salary_entity = output_df["Particulars"].astype(str).map(extract_salary_entity)
+    # Level 6: the payer named by a structured narration, else the existing
+    # cleaned-narration fallback.
+    salary_entity = output_df["Particulars"].astype(str).map(
+        lambda text: extract_narration_entity(text) or extract_salary_entity(text)
+    )
     output_df.loc[salary_mask, "Level_0"] = "credit"
     output_df.loc[salary_mask, "Level_1"] = ""
     output_df.loc[salary_mask, "Level_2"] = "System generated"
@@ -1338,6 +1763,13 @@ class BankStatementClassifier:
                 output_df.loc[row_index, "Debit"],
                 output_df.loc[row_index, "Credit"],
                 row_prediction,
+            )
+            row_prediction = apply_narration_purpose_override(
+                str(output_df.loc[row_index, "Particulars"]),
+                row_prediction,
+                output_df.loc[row_index, "Debit"],
+                output_df.loc[row_index, "Credit"],
+                [part_text for part_text, _ in row_parts],
             )
             row_prediction = apply_amount_direction_override(
                 output_df.loc[row_index, "Debit"],
