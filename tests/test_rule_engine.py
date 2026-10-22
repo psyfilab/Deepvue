@@ -1,5 +1,8 @@
 """Tests for deterministic rule classification."""
 
+# pyrefly: ignore [missing-import]
+import pytest
+
 from src.rule_engine import RuleEngine
 
 
@@ -39,3 +42,53 @@ def test_salary_is_not_a_rule_level_field() -> None:
         "Level_2": "",
         "Level_7": "",
     }
+
+
+@pytest.mark.parametrize(
+    ("keyword", "expected_level_1"),
+    [
+        ("UPI PAYMENT", "upi"),
+        ("IMPS TRANSFER", "imps"),
+        ("NEFT TRANSFER", "neft"),
+        ("NEFT-FDRLN...-CEOA EDUCATIONAL SOCIE", "neft"),
+        ("  neft-fdrln123-ceoa educational socie  ", "neft"),
+        ("nEfT / IOBAN / PRM FUELS", "neft"),
+        ("RTGS PAYMENT", "rtgs"),
+        ("RTGS-KVBLR123-SHARWIN IMPEX", "rtgs"),
+        ("  rTgS - KVBLR123 - SHARWIN IMPEX  ", "rtgs"),
+        ("NACH MANDATE", "nach"),
+        ("ACHDR PAYMENT", "nach"),
+        ("CHEQUE PAYMENT", "cheque"),
+        ("CHQ NO 12345", "cheque"),
+        ("CASH WITHDRAWAL", "cash"),
+    ],
+)
+def test_level_1_transaction_type_rules(
+    keyword: str,
+    expected_level_1: str,
+) -> None:
+    """Explicit transaction-type keywords map to Level 1."""
+
+    result = RuleEngine().classify(keyword)
+
+    assert result["Level_1"] == expected_level_1
+
+
+@pytest.mark.parametrize(
+    "keyword",
+    [
+        "SALARY CREDIT",
+        "AMAZON PAYMENT",
+        "GROCERY STORE",
+        "ONLINE TRANSFER",
+        "BENEFIT PAYMENT",
+        "XNEFTX FUEL STATION",
+        "XRTGSX RETAIL",
+    ],
+)
+def test_level_1_remains_empty_without_explicit_rail(keyword: str) -> None:
+    """Unmatched descriptions should not receive an invented rail."""
+
+    result = RuleEngine().classify(keyword)
+
+    assert result["Level_1"] == ""

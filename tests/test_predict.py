@@ -5,10 +5,13 @@ from __future__ import annotations
 from pathlib import Path
 
 import joblib
+import pandas as pd
 
 from src.predict import KeywordClassifier
 from src.preprocess import KeywordPreprocessor
 from src.prompt_part3 import PromptArtifacts
+from src.statement_classifier import BankStatementClassifier
+from src.statement_splitter import split_statement
 
 
 def _build_dummy_bundle(models_dir: Path) -> None:
@@ -35,6 +38,15 @@ def _build_dummy_bundle(models_dir: Path) -> None:
             "Level_5": "dining",
             "Level_6": "zomato",
             "Level_7": "",
+        },
+        # Simulate a preexisting lookup entry with missing deterministic labels.
+        preprocessor.transform("neft"): {
+            "Level_0": "", "Level_1": "", "Level_2": "", "Level_3": "",
+            "Level_4": "", "Level_5": "", "Level_6": "", "Level_7": "",
+        },
+        preprocessor.transform("rtgs"): {
+            "Level_0": "", "Level_1": "", "Level_2": "", "Level_3": "",
+            "Level_4": "", "Level_5": "", "Level_6": "", "Level_7": "",
         },
     }
     bundle = PromptArtifacts(
@@ -74,6 +86,30 @@ def test_classify_batch_matches_single_row_inference(tmp_path: Path) -> None:
     single_results = [classifier.classify(keyword) for keyword in keywords]
 
     assert batch_results == single_results
+
+
+def test_statement_pipeline_preserves_rails_for_exact_lookup_parts(tmp_path: Path) -> None:
+    """Hyphen splitting and exact lookup must not erase explicit rail labels."""
+
+    _build_dummy_bundle(tmp_path)
+    classifier = BankStatementClassifier.__new__(BankStatementClassifier)
+    classifier.keyword_classifier = KeywordClassifier(str(tmp_path))
+    statement = pd.DataFrame(
+        {
+            "Particulars": [
+                "NEFT-FDRLN123-CEOA EDUCATIONAL SOCIE",
+                "RTGS-KVBLR123-SHARWIN IMPEX",
+                "NEFT-IOBAN123-PRM FUELS",
+            ],
+            "Debit": [100, 200, 300],
+            "Credit": ["", "", ""],
+        }
+    )
+    split, _ = split_statement(statement)
+
+    classified = classifier.classify(split)
+
+    assert classified["Level_1"].tolist() == ["neft", "rtgs", "neft"]
 
 
 def test_level5_substring_cue_applies_without_exact_match(tmp_path: Path) -> None:

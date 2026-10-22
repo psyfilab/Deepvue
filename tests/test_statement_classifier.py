@@ -1209,3 +1209,63 @@ def test_pipeline_existing_level5_unchanged_without_narration_evidence():
     out = make_classifier().classify(statement_frame(rows))
     # No specific category evidence — Level 5 should remain blank.
     assert out.loc[0, "Level_5"] == ""
+
+
+# =============================================================================
+# Regressions: Date-less salary detection, Level_4 gateways, slash-UPI P2P
+# =============================================================================
+
+
+def test_detect_salary_without_date_column_still_flags_explicit_salary():
+    df = labelled_frame([{"Particulars": "NEFT SALARY ACME CORP", "Debit": "", "Credit": 50000}])
+    assert "Date" not in df.columns
+
+    out = detect_salary(df)
+
+    assert out.loc[0, "IsSalary"] == 1
+    assert out.loc[0, "Level_5"] == "salary"
+
+
+def test_detect_salary_without_date_column_skips_recurring_inference():
+    df = labelled_frame(
+        [
+            {"Particulars": "NEFT ACME", "Debit": "", "Credit": 30000},
+            {"Particulars": "NEFT ACME", "Debit": "", "Credit": 30000},
+        ]
+    )
+
+    out = detect_salary(df)
+
+    assert out["IsSalary"].tolist() == [0, 0]
+
+
+def test_slash_upi_with_named_payee_is_still_p2p():
+    out = apply_raw_transaction_overrides(
+        "UPI/DR/123/ARUN/SBIN/arun@sbi", blank_levels(), debit_value=200, credit_value=0
+    )
+
+    assert out["Level_3"] == "p2p"
+    assert out["Level_5"] == "p2p transfer"
+    assert out["Level_6"] == "arun"
+
+
+def test_hyphen_merchant_prefers_model_bank_over_gateway_when_narration_has_no_bank():
+    narration = "UPI-RAZORPAYSWIGGY-SWIGGY@OKAXIS-123456-NOTE"
+    canned = {
+        "UPI": {"Level_1": "upi"},
+        "RAZORPAYSWIGGY": {"Level_3": "institution", "Level_4": "razorpay"},
+        "NOTE": {"Level_4": "hdfc bank"},
+    }
+
+    out = make_classifier(canned).classify(statement_frame([upi_row(narration)]))
+
+    assert out.loc[0, "Level_4"] == "hdfc bank"
+    assert out.loc[0, "Level_6"] == "swiggy"
+
+
+def test_non_hyphen_row_still_takes_detected_gateway_level4():
+    out = apply_raw_transaction_overrides(
+        "RAZORPAY SOFTWARE PVT LTD", blank_levels(), debit_value=100, credit_value=0
+    )
+
+    assert out["Level_4"] == "razorpay"

@@ -39,6 +39,9 @@ SLASH_UPI_RE = re.compile(
     r"\bUPI\b(?:/\d+)?/(?:DR|CR)(?:/\d+)?/([^/\d\-][^/]{1,19})/([A-Z]{2,6})/(\S+)",
     flags=re.IGNORECASE,
 )
+# Payee names that carry no identity. A slash-format UPI row whose payee is one
+# of these gives no evidence of a person, so it is not asserted to be P2P.
+UPI_PLACEHOLDER_PAYEES = frozenset({"unknown", "na", "nil", "null", "none"})
 MERCHANT_MARKER_RE = re.compile(
     r"(?:^|[/|])\s*MERCHANT\s*(?:[/|]|$)",
     flags=re.IGNORECASE,
@@ -802,13 +805,17 @@ def extract_hyphen_upi_merchant(particulars: str) -> str:
 
 
 def is_payment_intermediary_label(label: str) -> bool:
-    """Return True for a label that names a payment platform/intermediary."""
+    """Return True for a label that names a payment platform/intermediary.
+
+    Bank names win over platform aliases: "paytm" appears in both tables and is
+    treated as a bank here.
+    """
 
     value = _normalize_compare(label)
-    if value in PLATFORM_ALIASES:
-        return True
     if not value or value in BANK_NAMES:
         return False
+    if value in PLATFORM_ALIASES:
+        return True
     letters = re.sub(r"[^a-z]", "", value)
     return any(fragment in letters for fragment in PAYMENT_INTERMEDIARY_FRAGMENTS)
 
@@ -855,16 +862,14 @@ def apply_hyphen_upi_merchant_override(
     level4_candidates = [result["Level_4"]] + [
         prediction.get("Level_4", "") for _, prediction in part_predictions
     ]
-    intermediary = next(
-        (label for label in level4_candidates if label and is_payment_intermediary_label(label)),
-        "",
-    )
+    # Level 4 on a merchant row names the bank, never the payment gateway: take a
+    # bank the model predicted, else the bank named by the narration, else leave
+    # it blank.
     bank = next(
         (label for label in level4_candidates if label and not is_payment_intermediary_label(label)),
         "",
     )
-    narration_bank = derive_upi_bank(particulars)
-    result["Level_4"] = (intermediary if not narration_bank else "") or bank or narration_bank
+    result["Level_4"] = bank or derive_upi_bank(particulars)
 
     result["Level_1"] = result["Level_1"] or "upi"
     result["Level_3"] = "merchant"
@@ -947,8 +952,17 @@ def apply_raw_transaction_overrides(
                 and not (SALARY_KEYWORDS.search(text) and not is_debit)
                 and not automated_debit
             ):
-                result["Level_3"] = "p2p"
-                result["Level_5"] = "p2p transfer"
+                if name in UPI_PLACEHOLDER_PAYEES:
+                    # No identifiable payee: nothing supports a person-to-person
+                    # claim, so withdraw an inferred p2p label instead of
+                    # asserting one.
+                    if result.get("Level_3") == "p2p":
+                        result["Level_3"] = ""
+                    if purpose == "p2p transfer":
+                        result["Level_5"] = ""
+                else:
+                    result["Level_3"] = "p2p"
+                    result["Level_5"] = "p2p transfer"
 
     if MERCHANT_MARKER_RE.search(marker_text):
         result["Level_3"] = "merchant"
@@ -966,7 +980,15 @@ def apply_raw_transaction_overrides(
         result["Level_6"] = entity
 
     detected_level4 = detect_level_4_platform_or_bank(marker_text)
-    if detected_level4:
+    # A hyphen-UPI known-merchant row has already had Level 4 resolved to a bank
+    # (or blanked) by apply_hyphen_upi_merchant_override. A gateway name found
+    # inside the narration (e.g. RAZORPAYZOMATO) must not overwrite that.
+    gateway_on_merchant_row = bool(
+        detected_level4
+        and extract_hyphen_upi_merchant(text)
+        and is_payment_intermediary_label(detected_level4)
+    )
+    if detected_level4 and not gateway_on_merchant_row:
         result["Level_4"] = detected_level4
 
     upper_text = text.upper()
@@ -1065,6 +1087,59 @@ def apply_initiation_mode_override(
             result["Level_2"] = "User-generated"
 
     return result
+
+
+# A cheque instrument narration: <CLG|TRF>/<drawer>/<6-digit cheque no>/<drawee
+# bank code>/<dd.mm.yyyy>, e.g. "TRF/SUNRAY ENGINEERING/000757/ICI/10.06.2025".
+# "TRF/<name>/ICI" without a cheque number and date is a plain transfer and
+# does not match.
+CHEQUE_INSTRUMENT_RE = re.compile(
+    r"^\s*(?:CLG|TRF)/[^/]+/(\d{6})/[A-Z]{2,4}/\d{2}\.\d{2}\.\d{4}\s*$",
+    flags=re.IGNORECASE,
+)
+# A returned instrument: "REJECT:<cheque no>:<return reason>".
+CHEQUE_RETURN_RE = re.compile(r"^\s*REJECT:(\d{1,6}):", flags=re.IGNORECASE)
+
+
+def apply_cheque_instrument_override(particulars: str, result: dict[str, str]) -> dict[str, str]:
+    """Fill a blank Level_1 with "cheque" for a full cheque-instrument narration.
+
+    Only a blank Level_1 is filled, so an explicit rail found elsewhere is kept.
+    """
+
+    if not result.get("Level_1") and CHEQUE_INSTRUMENT_RE.match(str(particulars or "")):
+        result["Level_1"] = "cheque"
+    return result
+
+
+def apply_cheque_return_level1(df: pd.DataFrame) -> pd.DataFrame:
+    """Mark "REJECT:<no>:..." rows as cheque when <no> is a cheque in the statement.
+
+    A REJECT line alone could be a cheque or a mandate return, so it is labelled
+    only when its number matches the cheque number of a CLG/TRF cheque
+    instrument in the same statement (per ``Source_File`` when present). Only
+    blank Level_1 values are filled.
+    """
+
+    if "Particulars" not in df.columns or "Level_1" not in df.columns:
+        return df
+
+    output_df = df.copy()
+    text = output_df["Particulars"].fillna("").astype(str)
+    groups = output_df["Source_File"].fillna("") if "Source_File" in output_df.columns else pd.Series("", index=output_df.index)
+    level_1 = output_df["Level_1"].fillna("").astype(str).str.strip()
+
+    cheque_numbers: dict[str, set[str]] = defaultdict(set)
+    for index, value in text.items():
+        match = CHEQUE_INSTRUMENT_RE.match(value)
+        if match:
+            cheque_numbers[groups[index]].add(match.group(1).lstrip("0"))
+
+    for index, value in text.items():
+        match = CHEQUE_RETURN_RE.match(value)
+        if match and not level_1[index] and match.group(1).lstrip("0") in cheque_numbers[groups[index]]:
+            output_df.at[index, "Level_1"] = "cheque"
+    return output_df
 
 
 def apply_amount_direction_override(
@@ -1212,7 +1287,14 @@ def detect_salary(df: pd.DataFrame) -> pd.DataFrame:
     output_df.loc[explicit_mask, "IsSalary"] = 1
     output_df.loc[explicit_mask, "SalaryConfidence"] = 1.0
 
-    dates = pd.to_datetime(output_df.get("Date"), errors="coerce")
+    # Without a Date column no row has a usable date, so recurring-credit
+    # inference is skipped; explicit salary evidence above still applies.
+    date_column = (
+        output_df["Date"]
+        if "Date" in output_df.columns
+        else pd.Series(pd.NaT, index=output_df.index)
+    )
+    dates = pd.to_datetime(date_column, errors="coerce")
     candidates = output_df.index[
         (~explicit_mask) & (~debit_mask) & (credit_num >= MIN_SALARY) & dates.notna()
     ]
@@ -1246,7 +1328,8 @@ def detect_salary(df: pd.DataFrame) -> pd.DataFrame:
         lambda text: extract_narration_entity(text) or extract_salary_entity(text)
     )
     output_df.loc[salary_mask, "Level_0"] = "credit"
-    output_df.loc[salary_mask, "Level_1"] = ""
+    # Level_1 is the payment rail (rtgs/neft/imps/cheque...); salary is a
+    # purpose, so an identified rail is kept rather than blanked.
     output_df.loc[salary_mask, "Level_2"] = "System generated"
     output_df.loc[salary_mask, "Level_5"] = "salary"
     output_df.loc[salary_mask, "Level_7"] = ""
@@ -1359,7 +1442,7 @@ LEVEL7_BILL_LEVEL5 = frozenset(
 
 LEVEL7_KEY_STOPWORDS = frozenset(
     {
-        "inf", "inft", "bil", "clg", "mmt", "trf", "trfr", "rtn", "to", "by", "from",
+        "inf", "inft", "bil", "paid", "clg", "mmt", "trf", "trfr", "rtn", "to", "by", "from",
         "via", "for", "ref", "txn", "dr", "cr", "debit", "credit", "upi", "neft", "imps",
         "rtgs", "payment", "transfer", "pay", "bank", "ltd", "pvt", "private", "limited",
         "reversal", "reversed", "rev", "refund", "return", "returned", "failed",
@@ -1720,6 +1803,10 @@ class BankStatementClassifier:
                 output_df.loc[row_index, "Credit"],
                 [part_text for part_text, _ in row_parts],
             )
+            row_prediction = apply_cheque_instrument_override(
+                str(output_df.loc[row_index, "Particulars"]),
+                row_prediction,
+            )
             row_prediction = apply_amount_direction_override(
                 output_df.loc[row_index, "Debit"],
                 output_df.loc[row_index, "Credit"],
@@ -1751,6 +1838,7 @@ class BankStatementClassifier:
 
         levels_df = pd.DataFrame(row_level_predictions, index=output_df.index)
         output_df = pd.concat([output_df, levels_df], axis=1)
+        output_df = apply_cheque_return_level1(output_df)
         output_df["First Level Classification"] = output_df.apply(
             derive_first_level_classification,
             axis=1,

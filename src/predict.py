@@ -8,6 +8,7 @@ import sys
 from pathlib import Path
 from typing import Any
 
+# pyrefly: ignore[missing-import]
 import joblib
 import yaml
 
@@ -217,12 +218,20 @@ class KeywordClassifier:
 
         exact_match = self.artifacts.exact_lookup.get(cleaned)
         if exact_match:
+            # Keep exact-lookup classifications, but let explicit deterministic
+            # rules correct missing or stale values in rule-owned levels.
+            exact_result = exact_match.copy()
+            rule_result = self.rule_engine.classify(raw_keyword)
+            for level_name in ("Level_0", "Level_1", "Level_2", "Level_7"):
+                if rule_result.get(level_name):
+                    exact_result[level_name] = rule_result[level_name]
+
             metadata["decision_source"] = "exact_lookup"
-            metadata["level3_source"] = "exact_lookup" if exact_match.get("Level_3") else ""
-            metadata["level5_source"] = "exact_lookup" if exact_match.get("Level_5") else ""
-            metadata["level3_confidence"] = 1.0 if exact_match.get("Level_3") else None
-            metadata["level5_confidence"] = 1.0 if exact_match.get("Level_5") else None
-            return exact_match.copy(), self._finalize_metadata(exact_match.copy(), metadata)
+            metadata["level3_source"] = "exact_lookup" if exact_result.get("Level_3") else ""
+            metadata["level5_source"] = "exact_lookup" if exact_result.get("Level_5") else ""
+            metadata["level3_confidence"] = 1.0 if exact_result.get("Level_3") else None
+            metadata["level5_confidence"] = 1.0 if exact_result.get("Level_5") else None
+            return exact_result, self._finalize_metadata(exact_result, metadata)
 
         result.update(self.rule_engine.classify(raw_keyword))
         if any(result.get(level_name) for level_name in ("Level_0", "Level_1", "Level_2", "Level_7")):
