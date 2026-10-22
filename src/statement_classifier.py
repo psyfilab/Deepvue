@@ -39,17 +39,10 @@ SLASH_UPI_RE = re.compile(
     r"\bUPI\b(?:/\d+)?/(?:DR|CR)(?:/\d+)?/([^/\d\-][^/]{1,19})/([A-Z]{2,6})/(\S+)",
     flags=re.IGNORECASE,
 )
-# Explicit merchant marker as its own narration segment, e.g. ".../MERCHANT/...".
-# Segments may be separated by "/" (raw slash format) or "|" (pipe format /
-# joined split parts), so both are accepted.
 MERCHANT_MARKER_RE = re.compile(
     r"(?:^|[/|])\s*MERCHANT\s*(?:[/|]|$)",
     flags=re.IGNORECASE,
 )
-# ATM cash withdrawal narrations, e.g. "ATM WDL ...", "ATM-WDL", "ATM/DR/...",
-# the same segments in pipe format ("ATM | DR | ..."), or the "ATW" form used
-# by several banks and the NFS network ("ATW-512345XXXXXX6789-...", "NFS/ATW/...").
-# ATW must stand alone as a token so words such as "ATWOOD" do not match.
 ATM_WITHDRAWAL_RE = re.compile(
     r"\bATM[\s\-/|]*WDL\b|\bATM\s*[/|]\s*DR\s*(?:[/|]|$)|\bATW(?![A-Za-z])",
     flags=re.IGNORECASE,
@@ -78,17 +71,14 @@ MANUAL_TRANSFER_RE = re.compile(
 
 
 def _marker_text(particulars: str, part_texts: list[str] | None = None) -> str:
-    """Return the narration plus its split parts, joined for marker detection.
-
-    The split parts keep each narration segment intact even when the
-    Particulars text has been normalised, so explicit markers such as
-    MERCHANT or ATM/DR are detected in either form.
-    """
+    """Return the narration plus its split parts, joined for marker detection."""
 
     pieces = [str(particulars or "")]
     if part_texts:
         pieces.append(" | ".join(part.strip() for part in part_texts if part and part.strip()))
     return " | ".join(piece for piece in pieces if piece)
+
+
 GATEWAY_VPA_FRAGMENTS = frozenset(
     {
         "gpay",
@@ -134,15 +124,10 @@ KNOWN_UPI_MERCHANTS = {
     "delfiniumfertility": "delfinium fertility",
     "ferticityivfclinic": "ferticity ivf clinic",
 }
-# Payment intermediaries sit between the payer and the shop. They show up in
-# narrations (e.g. "RAZORPAYZOMATO", "PAYVIARAZORPAY") but are never the
-# merchant the person actually paid, so they are not used as the Level_6 name.
 PAYMENT_INTERMEDIARY_FRAGMENTS = frozenset(
     {"gpay", "google", "paytm", "phonepe", "razorpay", "bharatpe", "mobikwik", "cred", "payu", "cashfree"}
 )
 KNOWN_MERCHANT_FRAGMENTS = GATEWAY_VPA_FRAGMENTS - PAYMENT_INTERMEDIARY_FRAGMENTS
-# Fallback Level_5 purpose for a recognised merchant when the keyword model has
-# no purpose for the merchant name itself.
 MERCHANT_DEFAULT_PURPOSES = {
     "amazon": "retail",
     "flipkart": "retail",
@@ -192,7 +177,6 @@ MERCHANT_DEFAULT_PURPOSES = {
     "paytmmoney": "financial services",
     "mirae": "financial services",
 }
-# Hyphen-delimited UPI narrations, e.g. "UPI-<payee>-<vpa>@<psp>-<ifsc>-<ref>-<note>".
 HYPHEN_UPI_RE = re.compile(r"^\s*UPI\s*-", flags=re.IGNORECASE)
 BANK_CODE_TO_NAME = {
     "sbin": "state bank of india",
@@ -210,101 +194,31 @@ BANK_CODE_TO_NAME = {
     "paytm": "paytm",
 }
 BANK_NAMES = frozenset(BANK_CODE_TO_NAME.values())
-# IFSC prefixes are not always the same as the short bank codes above
-# (ICICI's IFSC starts with ICIC, while its VPA handle is "icici").
 IFSC_PREFIX_TO_BANK = {**BANK_CODE_TO_NAME, "icic": "icici bank"}
 IFSC_RE = re.compile(r"^[A-Z]{4}0[A-Z0-9]{6}$")
 
-# Level 4 precedence:
-# 1. Explicit payment platform / payment intermediary
-# 2. Explicit bank name or IFSC bank code
-# 3. Blank if neither is identifiable
-
 PLATFORM_ALIASES = {
-    "google pay": (
-        "google pay",
-        "googlepay",
-        "gpay",
-        "tez",
-    ),
-    "phonepe": (
-        "phonepe",
-        "phone pe",
-    ),
-    "paytm": (
-        "paytm",
-        "paytm upi",
-        "paytm payments bank",
-    ),
-    "amazon pay": (
-        "amazon pay",
-        "amazonpay",
-    ),
-    "bhim": (
-        "bhim",
-        "bharat interface for money",
-    ),
-    "bharatpe": (
-        "bharatpe",
-        "bharat pe",
-    ),
-    "mobikwik": (
-        "mobikwik",
-        "mobi kwik",
-    ),
-    "cred": (
-        "cred pay",
-        "cred",
-    ),
-    "whatsapp pay": (
-        "whatsapp pay",
-        "whatsapp payments",
-    ),
-    "jiofinance": (
-        "jiofinance",
-        "jio finance",
-    ),
-    "razorpay": (
-        "razorpay",
-        "razor pay",
-    ),
-    "cashfree": (
-        "cashfree",
-        "cash free",
-    ),
-    "payu": (
-        "payu",
-        "pay u",
-    ),
-    "billdesk": (
-        "billdesk",
-        "bill desk",
-    ),
-    "juspay": (
-        "juspay",
-        "jus pay",
-    ),
-    "pine labs": (
-        "pine labs",
-        "pinelabs",
-    ),
-    "payzapp": (
-        "payzapp",
-        "pay zapp",
-    ),
-    "freecharge": (
-        "freecharge",
-        "free charge",
-    ),
-    "mobikwik zip": (
-        "mobikwik zip",
-    ),
+    "google pay": ("google pay", "googlepay", "gpay", "tez"),
+    "phonepe": ("phonepe", "phone pe"),
+    "paytm": ("paytm", "paytm upi", "paytm payments bank"),
+    "amazon pay": ("amazon pay", "amazonpay"),
+    "bhim": ("bhim", "bharat interface for money"),
+    "bharatpe": ("bharatpe", "bharat pe"),
+    "mobikwik": ("mobikwik", "mobi kwik"),
+    "cred": ("cred pay", "cred"),
+    "whatsapp pay": ("whatsapp pay", "whatsapp payments"),
+    "jiofinance": ("jiofinance", "jio finance"),
+    "razorpay": ("razorpay", "razor pay"),
+    "cashfree": ("cashfree", "cash free"),
+    "payu": ("payu", "pay u"),
+    "billdesk": ("billdesk", "bill desk"),
+    "juspay": ("juspay", "jus pay"),
+    "pine labs": ("pine labs", "pinelabs"),
+    "payzapp": ("payzapp", "pay zapp"),
+    "freecharge": ("freecharge", "free charge"),
+    "mobikwik zip": ("mobikwik zip",),
 }
 
-# Distinctive platform names that are also recognised when glued to other
-# letters inside one narration token, e.g. "RAZORPAYZOMATO" or "PAYVIARAZORPAY".
-# Short or ambiguous aliases (cred, payu, bhim, tez, gpay) are deliberately
-# excluded because they occur inside ordinary words such as "CREDIT".
 EMBEDDED_PLATFORM_ALIASES = {
     "razorpay": "razorpay",
     "cashfree": "cashfree",
@@ -321,9 +235,6 @@ EMBEDDED_PLATFORM_ALIASES = {
     "paytm": "paytm",
 }
 
-# UPI handles (the part after "@" in a VPA) issued only by one app. Matched
-# only directly after "@", so words such as "OKAY" or "SYBIL" never count.
-# "okhdfc" covers narrations that truncate "@okhdfcbank".
 UPI_APP_HANDLES = {
     "okicici": "google pay",
     "okhdfcbank": "google pay",
@@ -338,195 +249,59 @@ UPI_APP_HANDLE_RE = re.compile(
     r"@\s*(okhdfcbank|okhdfc|okicici|oksbi|okaxis|ybl|ibl|axl)(?![a-z0-9])"
 )
 
-# Alias -> normalized bank name.
-# Keep IFSC prefixes and bank-name aliases together so both can be detected.
 BANK_ALIASES = {
-    "state bank of india": (
-        "state bank of india",
-        "sbi",
-        "sbin",
-    ),
-    "hdfc bank": (
-        "hdfc bank",
-        "hdfc",
-    ),
-    "icici bank": (
-        "icici bank",
-        "icici",
-    ),
-    "axis bank": (
-        "axis bank",
-        "axis",
-        "utib",
-    ),
-    "kotak mahindra bank": (
-        "kotak mahindra bank",
-        "kotak bank",
-        "kotak",
-    ),
-    "punjab national bank": (
-        "punjab national bank",
-        "pnb",
-        "punb",
-    ),
-    "bank of baroda": (
-        "bank of baroda",
-        "bob",
-    ),
-    "bank of india": (
-        "bank of india",
-        "boi",
-    ),
-    "canara bank": (
-        "canara bank",
-        "canara",
-        "cnrb",
-    ),
-    "union bank of india": (
-        "union bank of india",
-        "union bank",
-        "ubin",
-    ),
-    "indian bank": (
-        "indian bank",
-        "idib",
-    ),
-    "indian overseas bank": (
-        "indian overseas bank",
-        "iob",
-        "ioba",
-    ),
-    "central bank of india": (
-        "central bank of india",
-        "cbi",
-        "cbin",
-    ),
-    "uco bank": (
-        "uco bank",
-        "uco",
-    ),
-    "bank of maharashtra": (
-        "bank of maharashtra",
-        "mahabank",
-        "mahb",
-    ),
-    "punjab and sind bank": (
-        "punjab and sind bank",
-        "psb",
-        "psib",
-    ),
-    "yes bank": (
-        "yes bank",
-        "yesb",
-    ),
-    "idfc first bank": (
-        "idfc first bank",
-        "idfc bank",
-        "idfc",
-    ),
-    "indusind bank": (
-        "indusind bank",
-        "indusind",
-        "inbk",
-    ),
-    "federal bank": (
-        "federal bank",
-        "federal",
-        "fdr",
-    ),
-    "bandhan bank": (
-        "bandhan bank",
-        "bandhan",
-        "bdbl",
-    ),
-    "rbl bank": (
-        "rbl bank",
-        "rbl",
-    ),
-    "south indian bank": (
-        "south indian bank",
-        "sib",
-        "sibl",
-    ),
-    "karnataka bank": (
-        "karnataka bank",
-        "ktkb",
-    ),
-    "city union bank": (
-        "city union bank",
-        "ciub",
-    ),
-    "karur vysya bank": (
-        "karur vysya bank",
-        "kvb",
-        "kvbl",
-    ),
-    "dcb bank": (
-        "dcb bank",
-        "dcb",
-    ),
-    "tamilnad mercantile bank": (
-        "tamilnad mercantile bank",
-        "tmb",
-        "tmbl",
-    ),
-    "au small finance bank": (
-        "au small finance bank",
-        "au bank",
-        "aubl",
-    ),
-    "equitas small finance bank": (
-        "equitas small finance bank",
-        "equitas",
-        "esfb",
-    ),
-    "ujjivan small finance bank": (
-        "ujjivan small finance bank",
-        "ujjivan",
-        "usfb",
-    ),
-    "jana small finance bank": (
-        "jana small finance bank",
-        "jana",
-        "jsfb",
-    ),
-    "paytm payments bank": (
-        "paytm payments bank",
-        "paytm bank",
-    ),
-    "india post payments bank": (
-        "india post payments bank",
-        "ippb",
-    ),
-    "fino payments bank": (
-        "fino payments bank",
-        "fino",
-    ),
-    "airtel payments bank": (
-        "airtel payments bank",
-        "airtel bank",
-    ),
+    "state bank of india": ("state bank of india", "sbi", "sbin"),
+    "hdfc bank": ("hdfc bank", "hdfc"),
+    "icici bank": ("icici bank", "icici"),
+    "axis bank": ("axis bank", "axis", "utib"),
+    "kotak mahindra bank": ("kotak mahindra bank", "kotak bank", "kotak"),
+    "punjab national bank": ("punjab national bank", "pnb", "punb"),
+    "bank of baroda": ("bank of baroda", "bob"),
+    "bank of india": ("bank of india", "boi"),
+    "canara bank": ("canara bank", "canara", "cnrb"),
+    "union bank of india": ("union bank of india", "union bank", "ubin"),
+    "indian bank": ("indian bank", "idib"),
+    "indian overseas bank": ("indian overseas bank", "iob", "ioba"),
+    "central bank of india": ("central bank of india", "cbi", "cbin"),
+    "uco bank": ("uco bank", "uco"),
+    "bank of maharashtra": ("bank of maharashtra", "mahabank", "mahb"),
+    "punjab and sind bank": ("punjab and sind bank", "psb", "psib"),
+    "yes bank": ("yes bank", "yesb"),
+    "idfc first bank": ("idfc first bank", "idfc bank", "idfc"),
+    "indusind bank": ("indusind bank", "indusind", "inbk"),
+    "federal bank": ("federal bank", "federal", "fdr"),
+    "bandhan bank": ("bandhan bank", "bandhan", "bdbl"),
+    "rbl bank": ("rbl bank", "rbl"),
+    "south indian bank": ("south indian bank", "sib", "sibl"),
+    "karnataka bank": ("karnataka bank", "ktkb"),
+    "city union bank": ("city union bank", "ciub"),
+    "karur vysya bank": ("karur vysya bank", "kvb", "kvbl"),
+    "dcb bank": ("dcb bank", "dcb"),
+    "tamilnad mercantile bank": ("tamilnad mercantile bank", "tmb", "tmbl"),
+    "au small finance bank": ("au small finance bank", "au bank", "aubl"),
+    "equitas small finance bank": ("equitas small finance bank", "equitas", "esfb"),
+    "ujjivan small finance bank": ("ujjivan small finance bank", "ujjivan", "usfb"),
+    "jana small finance bank": ("jana small finance bank", "jana", "jsfb"),
+    "paytm payments bank": ("paytm payments bank", "paytm bank"),
+    "india post payments bank": ("india post payments bank", "ippb"),
+    "fino payments bank": ("fino payments bank", "fino"),
+    "airtel payments bank": ("airtel payments bank", "airtel bank"),
 }
 
 
 def _contains_alias(text: str, alias: str) -> bool:
     """Match an alias as a phrase/token, not as part of a longer word."""
     escaped = re.escape(alias.strip())
-    # Permit spaces in multi-word names to match repeated whitespace.
     escaped = escaped.replace(r"\ ", r"\s+")
     return bool(re.search(rf"(?<![A-Za-z0-9]){escaped}(?![A-Za-z0-9])", text))
 
 
 def detect_level_4_platform_or_bank(text: str) -> str:
-    """
-    Return platform first; if no platform is found, return the bank.
-    Returns an empty string when there is insufficient evidence.
-    """
+    """Return platform first; if no platform is found, return the bank."""
     normalized = str(text or "").lower()
     if not normalized.strip():
         return ""
 
-    # Longest alias first to avoid shorter aliases winning prematurely.
     platform_matches = []
     for canonical, aliases in PLATFORM_ALIASES.items():
         for alias in aliases:
@@ -536,8 +311,6 @@ def detect_level_4_platform_or_bank(text: str) -> str:
         platform_matches.sort(reverse=True)
         return platform_matches[0][1]
 
-    # A distinctive platform name glued inside a longer token still counts as
-    # platform evidence and must win over any bank in the same narration.
     for token in re.findall(r"[a-z0-9]+", normalized):
         for alias, canonical in EMBEDDED_PLATFORM_ALIASES.items():
             if alias in token:
@@ -546,7 +319,6 @@ def detect_level_4_platform_or_bank(text: str) -> str:
         platform_matches.sort(reverse=True)
         return platform_matches[0][1]
 
-    # A UPI handle that only one app issues is reliable platform evidence.
     handle_match = UPI_APP_HANDLE_RE.search(normalized)
     if handle_match:
         return UPI_APP_HANDLES[handle_match.group(1)]
@@ -563,16 +335,7 @@ def detect_level_4_platform_or_bank(text: str) -> str:
     return ""
 
 
-# ---------------------------------------------------------------------------
-# Narration-level Level 5 purpose inference
-# ---------------------------------------------------------------------------
-# These patterns run on the *full narration* (Particulars), which typically
-# contains more evidence than any single keyword part.  They are applied only
-# when Level 5 is blank after all keyword-model and structured-UPI overrides.
-# Order matters: more specific patterns come before broader ones that share
-# keywords.  Labels reuse the ALLOWED_PURPOSES vocabulary from prompt_part3.py.
 NARRATION_LEVEL5_PATTERNS: list[tuple[re.Pattern[str], str]] = [
-    # Credit-card bill payment (must beat generic "loan repayment" rule)
     (
         re.compile(
             r"\b(?:credit\s*card|cc\s*bill|ccbp|ccpmt|cc\s*payment|card\s*payment"
@@ -581,7 +344,6 @@ NARRATION_LEVEL5_PATTERNS: list[tuple[re.Pattern[str], str]] = [
         ),
         "credit card",
     ),
-    # Loan / EMI repayment
     (
         re.compile(
             r"\b(?:emi|loan\s*repay|loan\s*emi|home\s*loan|personal\s*loan"
@@ -591,7 +353,6 @@ NARRATION_LEVEL5_PATTERNS: list[tuple[re.Pattern[str], str]] = [
         ),
         "loan repayment",
     ),
-    # Insurance premium
     (
         re.compile(
             r"\b(?:insurance|insur|policy\s*premium|premium\s*payment"
@@ -601,7 +362,6 @@ NARRATION_LEVEL5_PATTERNS: list[tuple[re.Pattern[str], str]] = [
         ),
         "insurance",
     ),
-    # Salary / payroll (applied only to credits — guarded at call site)
     (
         re.compile(
             r"\b(?:salary|payroll|wages|\bsal\b|payslip)\b",
@@ -609,7 +369,6 @@ NARRATION_LEVEL5_PATTERNS: list[tuple[re.Pattern[str], str]] = [
         ),
         "salary",
     ),
-    # Tax payments
     (
         re.compile(
             r"\b(?:income\s*tax|advance\s*tax|tds\s*payment|gst\s*payment"
@@ -618,7 +377,6 @@ NARRATION_LEVEL5_PATTERNS: list[tuple[re.Pattern[str], str]] = [
         ),
         "tax",
     ),
-    # Mobile / DTH recharge (recharge keyword only; dth recharge belongs to utilities)
     (
         re.compile(
             r"\b(?:topup|top\s*up|prepaid\s*recharge|mobile\s*recharge"
@@ -628,7 +386,6 @@ NARRATION_LEVEL5_PATTERNS: list[tuple[re.Pattern[str], str]] = [
         ),
         "mobile recharge",
     ),
-    # Utilities & bills (electricity, gas, broadband, DTH including DTH recharge)
     (
         re.compile(
             r"\b(?:electricity|electric\s*bill|water\s*bill|gas\s*bill|lpg"
@@ -639,7 +396,6 @@ NARRATION_LEVEL5_PATTERNS: list[tuple[re.Pattern[str], str]] = [
         ),
         "utilities",
     ),
-    # Pharmacy / medicine — before dining/healthcare to prevent cafe/health-bar overlap
     (
         re.compile(
             r"\b(?:pharmacy|pharma|medicos?|medicals?|medi\s*store|chemist|drugstore"
@@ -649,7 +405,6 @@ NARRATION_LEVEL5_PATTERNS: list[tuple[re.Pattern[str], str]] = [
         ),
         "pharmacy",
     ),
-    # Healthcare (hospitals, clinics — distinct from pharmacy)
     (
         re.compile(
             r"\b(?:hospital|clinic|medicare|healthcare|diagnostic"
@@ -660,7 +415,6 @@ NARRATION_LEVEL5_PATTERNS: list[tuple[re.Pattern[str], str]] = [
         ),
         "healthcare",
     ),
-    # Grocery — placed BEFORE dining so "Swiggy Instamart" hits grocery not dining
     (
         re.compile(
             r"\b(?:grocery|groceries|blinkit|zepto|bigbasket|grofers"
@@ -671,7 +425,6 @@ NARRATION_LEVEL5_PATTERNS: list[tuple[re.Pattern[str], str]] = [
         ),
         "grocery",
     ),
-    # Dining / food — placed after grocery
     (
         re.compile(
             r"\b(?:restaurant|zomato|swiggy|cafe|dhaba|food\s*court"
@@ -685,7 +438,6 @@ NARRATION_LEVEL5_PATTERNS: list[tuple[re.Pattern[str], str]] = [
         ),
         "dining",
     ),
-    # Fuel / petrol
     (
         re.compile(
             r"\b(?:petrol|diesel|fuel|hpcl|iocl|bpcl|hp\s*petrol"
@@ -695,7 +447,6 @@ NARRATION_LEVEL5_PATTERNS: list[tuple[re.Pattern[str], str]] = [
         ),
         "fuel",
     ),
-    # Travel / flight / accommodation bookings
     (
         re.compile(
             r"\b(?:makemytrip|mmt|goibibo|yatra|cleartrip|ixigo"
@@ -706,7 +457,6 @@ NARRATION_LEVEL5_PATTERNS: list[tuple[re.Pattern[str], str]] = [
         ),
         "travel",
     ),
-    # Transport / ride-hailing / metro / railways
     (
         re.compile(
             r"\b(?:uber|olacabs|ola\s*cabs?|rapido|irctc|indian\s*rail"
@@ -716,7 +466,6 @@ NARRATION_LEVEL5_PATTERNS: list[tuple[re.Pattern[str], str]] = [
         ),
         "transport",
     ),
-    # Education / school / college fees
     (
         re.compile(
             r"\b(?:school\s*fee|college\s*fee|tuition|tuition\s*fee"
@@ -726,7 +475,6 @@ NARRATION_LEVEL5_PATTERNS: list[tuple[re.Pattern[str], str]] = [
         ),
         "education",
     ),
-    # Investments / SIP / mutual funds
     (
         re.compile(
             r"\b(?:groww|zerodha|upstox|kuvera|smallcase|paytm\s*money"
@@ -736,7 +484,6 @@ NARRATION_LEVEL5_PATTERNS: list[tuple[re.Pattern[str], str]] = [
         ),
         "financial services",
     ),
-    # Subscriptions / streaming / OTT
     (
         re.compile(
             r"\b(?:netflix|spotify|hotstar|primevideo|youtube\s*premium"
@@ -746,7 +493,6 @@ NARRATION_LEVEL5_PATTERNS: list[tuple[re.Pattern[str], str]] = [
         ),
         "subscription",
     ),
-    # Retail / shopping (broad — after more specific retail sub-categories above)
     (
         re.compile(
             r"\b(?:amazon|flipkart|myntra|meesho|ajio|nykaa|snapdeal"
@@ -757,7 +503,6 @@ NARRATION_LEVEL5_PATTERNS: list[tuple[re.Pattern[str], str]] = [
         ),
         "retail",
     ),
-    # Digital services / payment platforms as last resort
     (
         re.compile(
             r"\b(?:paytm|gpay|google\s*pay|phonepe|razorpay|cashfree"
@@ -776,25 +521,11 @@ def apply_narration_purpose_override(
     credit_value: object = None,
     part_texts: list[str] | None = None,
 ) -> dict[str, str]:
-    """Fill a blank Level 5 purpose from the full narration when the keyword
-    model left it empty.
+    """Fill a blank Level 5 purpose from the full narration when keyword model left it empty."""
 
-    This is the last-resort fill pass: it only ever writes into a *blank*
-    Level 5 and never overwrites a value set by the keyword model or any
-    earlier override.  It applies ordered regex patterns to the full narration
-    (which contains more context than any individual keyword part).
-
-    Direction awareness:
-    - ``salary`` is only applied to credit rows.
-    - ``credit card`` (bill payment) is only applied to debit rows.
-    - All other categories apply regardless of direction.
-    """
-
-    # Nothing to do if Level 5 is already set.
     if result.get("Level_5"):
         return result
 
-    # ATM withdrawals are already handled by apply_atm_withdrawal_overrides.
     if result.get("Level_1") == "cash":
         return result
 
@@ -805,15 +536,13 @@ def apply_narration_purpose_override(
         if not pattern.search(text):
             continue
 
-        # salary is income — only on credits
         if purpose == "salary" and direction == "debit":
             continue
-        # credit card *bill payment* — only on debits
         if purpose == "credit card" and direction == "credit":
             continue
 
         result["Level_5"] = purpose
-        break  # First match wins; patterns ordered by specificity.
+        break
 
     return result
 
@@ -844,8 +573,6 @@ def _normalize_compare(value: str) -> str:
     return "" if value is None else str(value).strip().lower()
 
 
-# Level 6 holds the specific payee/payer/brand. These words describe the
-# transaction (narration prefixes, rails, bill types), not an entity.
 GENERIC_LEVEL6_WORDS = frozenset(
     {
         "to", "by", "from", "for", "via", "bill", "bills", "payment", "payments",
@@ -857,10 +584,7 @@ GENERIC_LEVEL6_WORDS = frozenset(
         "dth", "online", "txn", "transaction",
     }
 )
-# Structured slash narrations: <RAIL>/<DR|CR>/<ref>/<NAME>/<BANK>/..., where the
-# reference may sit before or after DR/CR (e.g. "UPI/449682688795/DR/ARUN/SBIN").
 SLASH_ENTITY_RAIL_RE = re.compile(r"\b(UPI|NEFT|IMPS|RTGS|ATM)/(.*)", flags=re.IGNORECASE)
-# BBPS biller id, e.g. "BBPS/DR/HDFCCC2025030457/CREDIT CARD BILL/".
 BBPS_BILLER_RE = re.compile(r"\bBBPS/(?:DR|CR)/([A-Z][A-Z ]*[A-Z])\d", flags=re.IGNORECASE)
 BBPS_BILLER_NAMES = {"jiofiber": "jio fiber", "tatasky": "tata sky"}
 
@@ -875,13 +599,7 @@ def is_generic_level6(value: str) -> bool:
 
 
 def extract_narration_entity(particulars: str) -> str:
-    """Return the payee/payer/biller explicitly named by a structured narration.
-
-    Handles slash narrations (UPI/NEFT/IMPS/RTGS/ATM: the first segment after
-    DR/CR that is not a reference number) and BBPS biller ids ("LIC2025...",
-    "HDFCCC2025..." -> "hdfc credit card"). Returns "" when the narration does
-    not identify an entity, so callers keep their existing fallback.
-    """
+    """Return the payee/payer/biller explicitly named by a structured narration."""
 
     text = str(particulars or "")
 
@@ -903,7 +621,7 @@ def extract_narration_entity(particulars: str) -> str:
     if direction_index is None:
         return ""
     for segment in segments[direction_index + 1 :]:
-        if re.search(r"\d{5,}", segment):  # transaction / NEFT reference
+        if re.search(r"\d{5,}", segment):
             continue
         name = re.sub(r"\s+", " ", segment).strip().lower()
         if name and not is_generic_level6(name):
@@ -913,17 +631,11 @@ def extract_narration_entity(particulars: str) -> str:
 
 
 def fill_specific_level6(particulars: str, result: dict[str, str]) -> dict[str, str]:
-    """Replace a blank, generic or category Level 6 with the narration's entity.
-
-    A specific Level 6 is never changed. When the narration names no entity,
-    the existing value is kept, except that a copy of the Level 5 category is
-    removed because a category is not an entity.
-    """
+    """Replace a blank, generic or category Level 6 with the narration's entity."""
 
     current = result.get("Level_6", "")
     is_category = bool(current) and _normalize_compare(current) == _normalize_compare(result.get("Level_5", ""))
     biller = BBPS_BILLER_RE.search(str(particulars or ""))
-    # A raw copy of the BBPS biller code ("hdfccc") is replaced by its readable form.
     is_raw_biller_code = bool(biller) and re.sub(r"[^a-z0-9]", "", _normalize_compare(current)) == re.sub(
         r"[^a-z0-9]", "", biller.group(1).lower()
     )
@@ -953,19 +665,13 @@ def _apply_transaction_rules(
     result: dict[str, str],
     default_p2p_purpose: bool = True,
 ) -> dict[str, str]:
-    """Apply a few row-level consistency rules after aggregation.
-
-    ``default_p2p_purpose`` lets a caller that has just cleared an unsupported
-    "p2p transfer" purpose stop the default below from putting it back.
-    """
+    """Apply row-level consistency rules after aggregation."""
 
     if default_p2p_purpose and result["Level_3"] == "p2p" and not result["Level_5"]:
         result["Level_5"] = "p2p transfer"
 
     if result["Level_1"] == "cash":
         result["Level_3"] = ""
-        # Keep a bank (e.g. the bank of an ATM or cash deposit machine); a
-        # payment platform cannot apply to a cash transaction.
         if is_payment_intermediary_label(result["Level_4"]):
             result["Level_4"] = ""
         result["Level_5"] = ""
@@ -996,9 +702,6 @@ def aggregate_part_predictions(
             if not result[level_name] and prediction.get(level_name):
                 result[level_name] = prediction[level_name]
 
-    # Level 6: the first part is usually the narration prefix ("TO TRANSFER",
-    # "TO BILL PAYMENT"), so prefer the first specific entity from any part and
-    # keep the first generic value only when no part names an entity.
     specific_level6 = next(
         (
             prediction["Level_6"]
@@ -1010,8 +713,6 @@ def aggregate_part_predictions(
     if specific_level6:
         result["Level_6"] = specific_level6
 
-    # Level 4 precedence: a payment intermediary predicted for any part wins
-    # over a bank predicted for an earlier part.
     intermediary = next(
         (
             prediction["Level_4"]
@@ -1075,16 +776,7 @@ def apply_structured_upi_overrides(
 
 
 def extract_hyphen_upi_merchant(particulars: str) -> str:
-    """Return the known merchant named in a hyphen-delimited UPI narration.
-
-    The narration is ``UPI-<payee>-<vpa>@<psp>-<ifsc>-<ref>-<note>``. Only the
-    VPA handle and the payee segment are searched, VPA first, because the
-    trailing note often names the payment gateway ("PAYVIARAZORPAY") or is
-    truncated ("REQUEST FROM AMAZO"). Payment intermediaries are not in the
-    merchant set, so a gateway can never be returned as the merchant. Returns
-    an empty string when no known merchant is found, or when an explicit
-    P2M/P2P marker means the structured UPI override already owns the row.
-    """
+    """Return the known merchant named in a hyphen-delimited UPI narration."""
 
     text = str(particulars or "")
     if not HYPHEN_UPI_RE.match(text):
@@ -1103,7 +795,6 @@ def extract_hyphen_upi_merchant(particulars: str) -> str:
 
     for candidate in [vpa_segment.split("@", 1)[0], *payee_segments]:
         letters = re.sub(r"[^a-z]", "", candidate.lower())
-        # Longest fragment first so the result does not depend on set ordering.
         for fragment in sorted(KNOWN_MERCHANT_FRAGMENTS, key=lambda item: (-len(item), item)):
             if fragment in letters:
                 return fragment
@@ -1111,12 +802,7 @@ def extract_hyphen_upi_merchant(particulars: str) -> str:
 
 
 def is_payment_intermediary_label(label: str) -> bool:
-    """Return True for a label that names a payment platform/intermediary.
-
-    Level_4 holds the intermediary when one is identified, else the bank. A
-    canonical platform name from ``PLATFORM_ALIASES`` (including "paytm") is an
-    intermediary; any other known bank name is not.
-    """
+    """Return True for a label that names a payment platform/intermediary."""
 
     value = _normalize_compare(label)
     if value in PLATFORM_ALIASES:
@@ -1128,12 +814,7 @@ def is_payment_intermediary_label(label: str) -> bool:
 
 
 def derive_upi_bank(particulars: str) -> str:
-    """Return the bank named by a UPI narration's IFSC prefix or VPA handle.
-
-    The IFSC (e.g. ``ICIC0DC0099``, even when split as ``ICI C0DC0099``) is
-    tried first, then the handle after ``@`` (e.g. ``@ICICI``). Returns an
-    empty string when neither identifies a bank in ``BANK_CODE_TO_NAME``.
-    """
+    """Return the bank named by a UPI narration's IFSC prefix or VPA handle."""
 
     segments = [segment.strip() for segment in str(particulars or "").split("-")]
 
@@ -1161,21 +842,7 @@ def apply_hyphen_upi_merchant_override(
     keyword_classifier: KeywordClassifier,
     result: dict[str, str],
 ) -> dict[str, str]:
-    """Classify hyphen-format UPI payments to a known merchant as merchant rows.
-
-    Without this, only ``UPI/DR/...`` (slash) and ``UPI|P2M|...`` (split-marker)
-    narrations reach a merchant rule. A hyphen narration such as
-    ``UPI-YESBANK-AMAZON@YAPL-...`` keeps the bank-style labels of its parts
-    (``institution`` plus a bank in Level_4), and the institution rule in
-    ``_apply_transaction_rules`` then blanks Level_6.
-
-    Level_6 is the merchant, never the payment intermediary. Level_4 is a
-    predicted payment intermediary (e.g. "razorpay") from the row or any part,
-    unless the narration's IFSC or VPA handle names a bank; otherwise the first
-    predicted bank, else the bank derived from the narration, else blank.
-    A platform named in the narration itself is applied afterwards by
-    ``apply_raw_transaction_overrides`` and takes precedence over all of these.
-    """
+    """Classify hyphen-format UPI payments to a known merchant as merchant rows."""
 
     merchant = extract_hyphen_upi_merchant(particulars)
     if not merchant:
@@ -1197,8 +864,6 @@ def apply_hyphen_upi_merchant_override(
         "",
     )
     narration_bank = derive_upi_bank(particulars)
-    # A predicted intermediary is a model guess; a bank named in the narration
-    # is evidence, so the predicted intermediary is used only without one.
     result["Level_4"] = (intermediary if not narration_bank else "") or bank or narration_bank
 
     result["Level_1"] = result["Level_1"] or "upi"
@@ -1217,11 +882,7 @@ def apply_debit_salary_guard(
     credit_value: object,
     result: dict[str, str],
 ) -> dict[str, str]:
-    """Drop a salary purpose from rows whose amounts say they are debits.
-
-    Salary is income, so it can only apply to credit rows. Rows with no usable
-    amounts (direction unknown) are left unchanged.
-    """
+    """Drop a salary purpose from rows whose amounts say they are debits."""
 
     if derive_direction_from_amounts(debit_value, credit_value) == "debit":
         if _normalize_compare(result.get("Level_5", "")) == "salary":
@@ -1243,15 +904,12 @@ def apply_raw_transaction_overrides(
     is_debit = direction == "debit"
     marker_text = _marker_text(text, part_texts)
 
-    # ACH credits are institutional receipts, not person-to-person transfers.
-    # Only assign dividend purpose when the narration explicitly supports it.
     if re.search(r"\bACH\b", marker_text, flags=re.IGNORECASE) and direction == "credit":
         if re.search(r"\bDIVIDEND(?:S)?\b", marker_text, flags=re.IGNORECASE):
             result["Level_5"] = "dividend"
         elif result.get("Level_5") == "p2p transfer":
             result["Level_5"] = ""
 
-    # System-initiated debits, including card autopay, are not P2P transfers.
     automated_debit = bool(SYSTEM_INITIATED_RE.search(marker_text)) and is_debit
     if automated_debit:
         if result.get("Level_5") == "p2p transfer":
@@ -1276,7 +934,6 @@ def apply_raw_transaction_overrides(
             if result.get("Level_5") == "p2p transfer":
                 result["Level_5"] = ""
         else:
-            # Preserve a useful merchant purpose already found by the classifier.
             purpose = result.get("Level_5", "")
             if (
                 purpose
@@ -1290,47 +947,34 @@ def apply_raw_transaction_overrides(
                 and not (SALARY_KEYWORDS.search(text) and not is_debit)
                 and not automated_debit
             ):
-                # Plain UPI: a named payee at a bank, with no gateway handle,
-                # merchant purpose or merchant/institution label, is a P2P
-                # transfer. Explicit MERCHANT markers below still win.
                 result["Level_3"] = "p2p"
                 result["Level_5"] = "p2p transfer"
 
-    # An explicit MERCHANT marker takes precedence over a generic P2P label.
     if MERCHANT_MARKER_RE.search(marker_text):
         result["Level_3"] = "merchant"
         if result.get("Level_5") == "p2p transfer":
             result["Level_5"] = ""
 
-    # Salary is income and must not be inferred from a debit.
     if SALARY_KEYWORDS.search(text) and not is_debit:
-        # Prefer the payer named by a structured narration ("NISHA MA");
-        # otherwise keep the existing cleaned-narration fallback.
         entity = extract_narration_entity(text)
         if not entity:
             entity = SALARY_KEYWORDS.sub("", text)
             entity = re.sub(r"[\-/|]+", " ", entity)
             entity = re.sub(r"\s+", " ", entity).strip().lower()
 
-        # Salary purpose does not establish counterparty type.
         result["Level_5"] = "salary"
         result["Level_6"] = entity
 
-    # Level 4: payment platform / bank detection (salary credits included).
     detected_level4 = detect_level_4_platform_or_bank(marker_text)
     if detected_level4:
         result["Level_4"] = detected_level4
 
-    # Correct known merchant UPI transactions without changing
-    # their already-detected purpose.
     upper_text = text.upper()
     parts = upper_text.split("-", 2)
     first_part = parts[1].strip() if len(parts) > 1 else ""
     merchant_key = re.sub(r"[^a-z0-9]", "", first_part.lower())
 
     merchant_name = KNOWN_UPI_MERCHANTS.get(merchant_key)
-
-    # PAYTMQR is evidence of a QR merchant payment.
     is_paytm_qr = "PAYTMQR" in upper_text
 
     if upper_text.startswith("UPI-") and (merchant_name or is_paytm_qr):
@@ -1341,16 +985,11 @@ def apply_raw_transaction_overrides(
         elif not result.get("Level_6"):
             result["Level_6"] = first_part.lower()
 
-        # Remove an unsupported P2P purpose but preserve useful
-        # purposes such as grocery, retail, or digital services.
         if result.get("Level_5") == "p2p transfer":
             result["Level_5"] = ""
 
-    # Level 6: replace a generic label ("to transfer", "to bill payment") with
-    # the payee/biller the narration names, if it names one.
     fill_specific_level6(text, result)
 
-    # Do not let the p2p default re-add a purpose the automated-debit rule cleared.
     return _apply_transaction_rules(result, default_p2p_purpose=not automated_debit)
 
 
@@ -1361,12 +1000,7 @@ def apply_atm_withdrawal_overrides(
     debit_value: object = None,
     credit_value: object = None,
 ) -> dict[str, str]:
-    """Mark ATM cash withdrawals as cash and drop contradictory P2P labels.
-
-    Runs after the other row-level overrides and does not re-apply the
-    generic cash rule, so bank and ATM details (Level_4 / Level_6) are kept.
-    Credit rows (e.g. failed ATM reversals) are left unchanged.
-    """
+    """Mark ATM cash withdrawals as cash and drop contradictory P2P labels."""
 
     text = _marker_text(particulars, [part_text for part_text, _ in part_predictions])
     if not ATM_WITHDRAWAL_RE.search(text):
@@ -1377,9 +1011,6 @@ def apply_atm_withdrawal_overrides(
     bank_name = result["Level_4"]
     location = result["Level_6"]
     if not bank_name:
-        # The generic cash rule may have blanked a bank detected from the
-        # narration (e.g. "HDFC BANK ATM"); re-detect it before falling back to
-        # the part predictions.
         bank_name = detect_level_4_platform_or_bank(text)
     for _, prediction in part_predictions:
         if not bank_name and prediction.get("Level_4"):
@@ -1392,13 +1023,9 @@ def apply_atm_withdrawal_overrides(
         ):
             location = prediction["Level_6"]
     if not location or is_generic_level6(location):
-        # e.g. "ATM/DR/729425/ICICI BANK ATM/..." names the ATM itself.
         location = extract_narration_entity(particulars) or location
 
     result["Level_1"] = "cash"
-    # An ATM withdrawal is a cash transaction, not a P2P/merchant payment or
-    # a salary transaction. Clear all purpose/entity-type labels that can
-    # contradict this (including "retail", which appeared in File 4).
     result["Level_3"] = ""
     result["Level_5"] = ""
     result["Level_4"] = bank_name
@@ -1421,18 +1048,14 @@ def apply_initiation_mode_override(
     text = _marker_text(particulars, part_texts)
     direction = derive_direction_from_amounts(debit_value, credit_value)
 
-    # Explicit automatic-payment mechanisms take priority.
     if SYSTEM_INITIATED_RE.search(text):
         result["Level_2"] = "System generated"
         return result
 
-    # Agreed project rule: explicitly identified salary credits are system-generated.
     if SALARY_KEYWORDS.search(text) and direction == "credit":
         result["Level_2"] = "System generated"
         return result
 
-    # Outgoing payments and ATM withdrawals are treated as user-initiated.
-    # Do not infer initiation mode for incoming transfers from the rail alone.
     if direction == "debit":
         if (
             ATM_WITHDRAWAL_RE.search(text)
@@ -1441,7 +1064,6 @@ def apply_initiation_mode_override(
         ):
             result["Level_2"] = "User-generated"
 
-    # Ambiguous transactions remain blank.
     return result
 
 
@@ -1547,10 +1169,8 @@ def detect_salary(df: pd.DataFrame) -> pd.DataFrame:
         if "Debit" in output_df.columns
         else pd.Series(0.0, index=output_df.index)
     )
-    # Salary is income: a row that is a debit can never be salary.
     debit_mask = (debit_num > 0) & (credit_num <= 0)
 
-    # Remove stale salary labels from debit rows and re-derive their labels.
     stale_level_5 = (
         output_df["Level_5"].astype(str).str.strip().str.lower().eq("salary")
         if "Level_5" in output_df.columns
@@ -1622,8 +1242,6 @@ def detect_salary(df: pd.DataFrame) -> pd.DataFrame:
     output_df.loc[debit_mask, "SalaryConfidence"] = 0.0
 
     salary_mask = output_df["IsSalary"].eq(1)
-    # Level 6: the payer named by a structured narration, else the existing
-    # cleaned-narration fallback.
     salary_entity = output_df["Particulars"].astype(str).map(
         lambda text: extract_narration_entity(text) or extract_salary_entity(text)
     )
@@ -1662,7 +1280,6 @@ def build_salary_summary(df: pd.DataFrame) -> pd.DataFrame:
     return salary_df[available_columns].reset_index(drop=True)
 
 
-# Level 2: Initiation Mode (SYSTEM_INITIATED_RE is defined near the top of the file)
 USER_INITIATED_RE = re.compile(
     r"\b(?:ATM[\s/-]*WDL|ATM\s+CASH\s+WITHDRAWAL|"
     r"POS\s+PURCHASE|CARD\s+PURCHASE)\b",
@@ -1678,14 +1295,346 @@ def apply_strict_level2(df: pd.DataFrame) -> pd.DataFrame:
     for idx, row in output_df.iterrows():
         particulars = str(row.get("Particulars", "") or "").strip()
 
-        # Explicit automated-payment evidence takes priority.
         if SYSTEM_INITIATED_RE.search(particulars):
             output_df.at[idx, "Level_2"] = "System generated"
 
-        # Salary credits identified by the existing salary-detection pipeline.
         elif row.get("IsSalary", 0) == 1:
             output_df.at[idx, "Level_2"] = "System generated"
 
+    return output_df
+
+
+# ---------------------------------------------------------------------------
+# Level 7: Recurrence Classification (recurring / one-time)
+# ---------------------------------------------------------------------------
+LEVEL7_RECURRING = "recurring"
+LEVEL7_ONE_TIME = "one-time"
+
+# (name, min gap days, max gap days, min distinct dates in the chain)
+LEVEL7_CADENCES = (
+    ("monthly", 25, 35, 2),
+    ("bimonthly", 50, 68, 2),
+    ("quarterly", 75, 100, 2),
+    ("fortnightly", 12, 16, 3),
+    ("weekly", 5, 9, 3),
+)
+LEVEL7_AMOUNT_SPREAD = 0.10  # fixed-amount tolerance for non-bill chains
+LEVEL7_P2P_AMOUNT_SPREAD = 0.05  # tighter for person-to-person transfers
+LEVEL7_EXACT_SPREAD = 0.01  # "same amount" for a two-date pair
+LEVEL7_PAIR_DAY_TOLERANCE = 3  # day-of-month drift allowed for a two-date pair
+LEVEL7_REVERSAL_WINDOW_DAYS = 10
+
+# Refunds, reversals and failed or returned items are never a recurrence.
+LEVEL7_REVERSAL_RE = re.compile(
+    r"\b(?:revers(?:al|ed)?|rev|refund(?:ed)?|return(?:ed)?|rtn|chargeback|"
+    r"failed|reject(?:ed)?|bounce[d]?|unpaid|insufficient|declin\w*|cancel\w*|"
+    r"unsuccess\w*|dishonor\w*|disput\w*)\b",
+    flags=re.IGNORECASE,
+)
+# Fees and one-off loan events that mention EMI but are not an instalment.
+LEVEL7_NOT_INSTRUMENT_RE = re.compile(
+    r"\b(?:fee|fees|charge|charges|penalt(?:y|ies)|processing|conversion|"
+    r"foreclos\w*|pre[\s-]?payment|prepay\w*|part[\s-]?payment|waiver|"
+    r"regist\w*|cancel\w*)\b",
+    flags=re.IGNORECASE,
+)
+# Standing-instruction style evidence that is reliable even on manual transfer rails.
+LEVEL7_MANDATE_RE = re.compile(
+    r"\b(?:NACH|ACH|ECS|AUTO[\s-]?DEBIT|AUTODEBIT|AUTO[\s-]?PAY|AUTOPAY|"
+    r"STANDING\s+INSTRUCTION|RECURRING\s+PAYMENT|UPI\s+MANDATE|SI[\s-]?DEBIT|MANDATE)\b",
+    flags=re.IGNORECASE,
+)
+LEVEL7_MANUAL_RAIL_RE = re.compile(r"\b(?:UPI|IMPS|NEFT|RTGS)\b", flags=re.IGNORECASE)
+
+# Specific bill/loan/utility keywords (excluding broad terms like bare 'bill' or 'payment').
+LEVEL7_BILL_RE = re.compile(
+    r"\b(?:emi|loan|instal(?:l)?ments?|premium|insurance|policy|sip|mutual\s+fund|"
+    r"subscription|broadband|electricity|water|gas|dth|piped\s+gas|lpg|"
+    r"credit\s+card|bbps)\b",
+    flags=re.IGNORECASE,
+)
+LEVEL7_BILL_LEVEL5 = frozenset(
+    {"loan repayment", "utilities", "mobile recharge", "insurance", "credit card", "subscription"}
+)
+
+LEVEL7_KEY_STOPWORDS = frozenset(
+    {
+        "inf", "inft", "bil", "clg", "mmt", "trf", "trfr", "rtn", "to", "by", "from",
+        "via", "for", "ref", "txn", "dr", "cr", "debit", "credit", "upi", "neft", "imps",
+        "rtgs", "payment", "transfer", "pay", "bank", "ltd", "pvt", "private", "limited",
+        "reversal", "reversed", "rev", "refund", "return", "returned", "failed",
+        "reject", "rejected", "bounced", "bounce", "unpaid", "insufficient", "funds",
+        "gpay", "googlepay", "phonepe", "paytm", "razorpay", "billdesk", "cashfree",
+        "payu", "bhim", "cred", "mobikwik", "amazonpay", "payzapp", "freecharge",
+        "pinelabs", "juspay", "bharatpe",
+    }
+)
+LEVEL7_INFT_RE = re.compile(r"^\s*INF/INFT/[^/]*/([^/]*)/(.+)$", flags=re.IGNORECASE)
+LEVEL7_WIRE_RE = re.compile(r"^\s*(?:NEFT|RTGS)[-:][A-Za-z0-9]{8,}[-/](.+)$", flags=re.IGNORECASE)
+LEVEL7_CLEARING_RE = re.compile(r"^\s*CLG/([^/]+)/", flags=re.IGNORECASE)
+
+
+def _level7_parse_date(value: object) -> pd.Timestamp | None:
+    """Return a normalised date, or None. Text dates are read day-first."""
+
+    if value is None or (not isinstance(value, str) and pd.isna(value)):
+        return None
+    if not isinstance(value, str):
+        stamp = pd.Timestamp(value)
+        return None if pd.isna(stamp) else stamp.normalize()
+    text = value.strip()
+    if not text:
+        return None
+    for fmt in ("%d/%m/%y", "%d/%m/%Y", "%d-%m-%y", "%d-%m-%Y", "%Y-%m-%d"):
+        try:
+            return pd.Timestamp(pd.to_datetime(text, format=fmt)).normalize()
+        except (ValueError, TypeError):
+            continue
+    stamp = pd.to_datetime(text, dayfirst=True, errors="coerce")
+    return None if pd.isna(stamp) else pd.Timestamp(stamp).normalize()
+
+
+def _level7_clean_key(text: str) -> str:
+    """Lower-case identity with reference numbers, rails and filler removed."""
+
+    tokens = []
+    for raw in re.split(r"[^A-Za-z0-9]+", str(text or "").lower()):
+        if not raw:
+            continue
+        if re.search(r"\d", raw) and len(raw) >= 6:
+            continue
+        word = re.sub(r"\d+", "", raw)
+        if not word or word in LEVEL7_KEY_STOPWORDS:
+            continue
+        tokens.append(word)
+    return " ".join(tokens)
+
+
+def level7_counterparty(particulars: object) -> str:
+    """Return a normalised payee/payer identity that ignores changing references."""
+
+    text = str(particulars or "").strip()
+    if not text:
+        return ""
+    entity = extract_narration_entity(text)
+    if entity:
+        return _level7_clean_key(entity)
+    inft = LEVEL7_INFT_RE.match(text)
+    if inft:
+        return _level7_clean_key(inft.group(2))
+    wire = LEVEL7_WIRE_RE.match(text)
+    if wire:
+        for segment in re.split(r"[-/]", wire.group(1)):
+            key = _level7_clean_key(segment)
+            if key:
+                return key
+        return ""
+    clearing = LEVEL7_CLEARING_RE.match(text)
+    if clearing:
+        return _level7_clean_key(clearing.group(1))
+    return _level7_clean_key(text)
+
+
+def _level7_explicit_evidence(text: str, is_debit: bool) -> bool:
+    """Return True for reliable EMI / standing-instruction evidence on a debit."""
+
+    if not is_debit or not text:
+        return False
+    if LEVEL7_REVERSAL_RE.search(text) or LEVEL7_NOT_INSTRUMENT_RE.search(text):
+        return False
+    if LEVEL7_MANUAL_RAIL_RE.search(text):
+        return bool(LEVEL7_MANDATE_RE.search(text))
+    return bool(SYSTEM_INITIATED_RE.search(text))
+
+
+def _is_month_end(ts: pd.Timestamp) -> bool:
+    """Return True if timestamp is within 3 days of the end of its month."""
+    return (ts + pd.Timedelta(days=4)).month != ts.month
+
+
+def _level7_chain_qualifies(
+    cadence: str,
+    count: int,
+    amounts: list[float],
+    dates: list[pd.Timestamp],
+    bill_like: bool,
+    is_p2p: bool,
+) -> bool:
+    """Apply the corroboration rules to one cadence chain."""
+
+    if bill_like and not is_p2p:
+        return True
+
+    ordered = sorted(amounts)
+    median = ordered[len(ordered) // 2]
+    spread = (ordered[-1] - ordered[0]) / median if median > 0 else float("inf")
+
+    if is_p2p:
+        return count >= 3 and spread <= LEVEL7_P2P_AMOUNT_SPREAD
+
+    if count >= 3:
+        return spread <= LEVEL7_AMOUNT_SPREAD
+
+    if cadence in ("monthly", "bimonthly") and count == 2:
+        d1, d2 = dates[0], dates[1]
+        days_of_month = [d1.day, d2.day]
+        drift = max(days_of_month) - min(days_of_month)
+        drift = min(drift, 31 - drift)
+        if _is_month_end(d1) and _is_month_end(d2):
+            drift = 0
+        return spread <= LEVEL7_EXACT_SPREAD and drift <= LEVEL7_PAIR_DAY_TOLERANCE
+
+    return False
+
+
+def _level7_chains(dates: list[pd.Timestamp], low: int, high: int) -> list[list[int]]:
+    """Split sorted unique dates into runs whose consecutive gaps are in [low, high]."""
+
+    chains: list[list[int]] = []
+    run = [0]
+    for position in range(1, len(dates)):
+        gap = (dates[position] - dates[position - 1]).days
+        if low <= gap <= high:
+            run.append(position)
+        else:
+            if len(run) > 1:
+                chains.append(run)
+            run = [position]
+    if len(run) > 1:
+        chains.append(run)
+    return chains
+
+
+def decide_level7(df: pd.DataFrame) -> list[tuple[str, str]]:
+    """Return a (label, reason) pair per row. Reason is "" for non-transactions."""
+
+    size = len(df)
+    columns = df.columns
+    debit_num = df["Debit"].map(parse_amount) if "Debit" in columns else pd.Series(0.0, index=df.index)
+    credit_num = df["Credit"].map(parse_amount) if "Credit" in columns else pd.Series(0.0, index=df.index)
+    text_col = df["Particulars"] if "Particulars" in columns else pd.Series("", index=df.index)
+    date_col = df["Date"] if "Date" in columns else pd.Series(None, index=df.index)
+    level1 = df["Level_1"] if "Level_1" in columns else pd.Series("", index=df.index)
+    level3 = df["Level_3"] if "Level_3" in columns else pd.Series("", index=df.index)
+    level5 = df["Level_5"] if "Level_5" in columns else pd.Series("", index=df.index)
+
+    rows = []
+    for position in range(size):
+        debit, credit = float(debit_num.iloc[position]), float(credit_num.iloc[position])
+        text = "" if pd.isna(text_col.iloc[position]) else str(text_col.iloc[position])
+        if debit <= 0 and credit <= 0:
+            rows.append(None)
+            continue
+        direction = "debit" if debit > 0 and credit <= 0 else "credit" if credit > 0 and debit <= 0 else "mixed"
+        l1 = "" if pd.isna(level1.iloc[position]) else str(level1.iloc[position]).strip().lower()
+        l3 = "" if pd.isna(level3.iloc[position]) else str(level3.iloc[position]).strip().lower()
+        l5 = "" if pd.isna(level5.iloc[position]) else str(level5.iloc[position]).strip().lower()
+        rows.append(
+            {
+                "text": text,
+                "date": _level7_parse_date(date_col.iloc[position]),
+                "amount": max(debit, credit),
+                "direction": direction,
+                "key": level7_counterparty(text),
+                "reversal": bool(LEVEL7_REVERSAL_RE.search(text)),
+                "cash": l1 == "cash" or bool(ATM_WITHDRAWAL_RE.search(text)),
+                "p2p": l3 == "p2p" or l5 == "p2p transfer",
+                "bill": bool(LEVEL7_BILL_RE.search(text)) or l5 in LEVEL7_BILL_LEVEL5,
+                "reversed": False,
+            }
+        )
+
+    by_amount: dict[int, list[int]] = defaultdict(list)
+    for position, row in enumerate(rows):
+        if row and not row["reversal"] and row["date"] is not None:
+            by_amount[round(row["amount"] * 100)].append(position)
+    for position, row in enumerate(rows):
+        if not row or not row["reversal"] or row["date"] is None:
+            continue
+        candidates = [
+            other
+            for other in by_amount.get(round(row["amount"] * 100), [])
+            if not rows[other]["reversed"]
+            and rows[other]["direction"] != row["direction"]
+            and abs((row["date"] - rows[other]["date"]).days) <= LEVEL7_REVERSAL_WINDOW_DAYS
+            and (not row["key"] or rows[other]["key"] == row["key"])
+        ]
+        if candidates:
+            best_candidate = min(candidates, key=lambda other: abs((row["date"] - rows[other]["date"]).days))
+            rows[best_candidate]["reversed"] = True
+
+    groups: dict[tuple[str, str], list[int]] = defaultdict(list)
+    for position, row in enumerate(rows):
+        if (
+            row
+            and row["date"] is not None
+            and row["key"]
+            and not row["reversal"]
+            and not row["reversed"]
+            and not row["cash"]
+            and row["direction"] != "mixed"
+        ):
+            groups[(row["direction"], row["key"])].append(position)
+
+    history: dict[int, str] = {}
+    for members in groups.values():
+        by_date: dict[pd.Timestamp, list[int]] = defaultdict(list)
+        for position in members:
+            by_date[rows[position]["date"]].append(position)
+        dates = sorted(by_date)
+        if len(dates) < 2:
+            continue
+        for cadence, low, high, minimum in LEVEL7_CADENCES:
+            for chain in _level7_chains(dates, low, high):
+                if len(chain) < minimum:
+                    continue
+                chain_rows = [position for index in chain for position in by_date[dates[index]]]
+                chain_dates = [dates[index] for index in chain]
+                amounts = []
+                for index in chain:
+                    distinct = {round(rows[p]["amount"], 2) for p in by_date[dates[index]]}
+                    amounts.append(sum(distinct))
+                if _level7_chain_qualifies(
+                    cadence,
+                    len(chain),
+                    amounts,
+                    chain_dates,
+                    any(rows[p]["bill"] for p in chain_rows),
+                    any(rows[p]["p2p"] for p in chain_rows),
+                ):
+                    for position in chain_rows:
+                        history.setdefault(position, f"{cadence}_history")
+
+    decisions: list[tuple[str, str]] = []
+    for position, row in enumerate(rows):
+        if row is None:
+            decisions.append(("", "not_a_transaction"))
+        elif row["reversal"]:
+            decisions.append((LEVEL7_ONE_TIME, "reversal_or_failed"))
+        elif row["reversed"]:
+            decisions.append((LEVEL7_ONE_TIME, "reversed_original"))
+        elif _level7_explicit_evidence(row["text"], row["direction"] == "debit"):
+            decisions.append((LEVEL7_RECURRING, "explicit_instruction"))
+        elif position in history:
+            decisions.append((LEVEL7_RECURRING, history[position]))
+        elif row["date"] is None:
+            decisions.append((LEVEL7_ONE_TIME, "missing_date"))
+        elif not row["key"]:
+            decisions.append((LEVEL7_ONE_TIME, "no_counterparty"))
+        else:
+            decisions.append((LEVEL7_ONE_TIME, "no_reliable_pattern"))
+    return decisions
+
+
+def apply_level7_recurrence(df: pd.DataFrame) -> pd.DataFrame:
+    """Set Level_7 to "recurring" or "one-time" for every valid transaction.
+
+    Only the Level_7 column is written. Rows without a positive Debit or Credit
+    are not transactions and get a blank Level_7.
+    """
+
+    output_df = df.copy()
+    output_df["Level_7"] = [label for label, _ in decide_level7(output_df)]
     return output_df
 
 
@@ -1813,5 +1762,6 @@ class BankStatementClassifier:
 
         output_df = detect_salary(output_df)
         output_df = apply_strict_level2(output_df)
+        output_df = apply_level7_recurrence(output_df)
         logger.info("Classified %s statement rows", len(output_df))
         return output_df
