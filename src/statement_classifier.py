@@ -585,8 +585,26 @@ GENERIC_LEVEL6_WORDS = frozenset(
         "recvd", "clrd", "bouncd", "pdc", "intl", "ref", "credit", "debit", "card",
         "recharge", "mobile", "premium", "insurance", "electricity", "broadband",
         "dth", "online", "txn", "transaction",
+        # Bank channel / product codes that prefix narrations (not entities).
+        "inf", "inft", "bil", "ift", "inb", "mmt", "clg", "trfr", "cms", "gib",
+        "onl", "impstxn", "emi", "loan", "return", "returned", "rtn", "chg",
+        "charges", "gst",
     }
 )
+# Counterparty position in common bank narration layouts (used for Level 6).
+#   NEFT-<UTR>-<NAME>-...          RTGS RETURN-<UTR>-<NAME>
+#   CLG|TRF/<DRAWER>/<chq no>/...  cheque instruments
+#   INF|BIL/INFT/<ref>/.../<NAME>  in-bank net-banking transfers (name is last)
+#   MMT/IMPS/<rrn>/<remark>/<NAME>/<bank>
+#   TRFR TO|FROM: <NAME>           in-bank transfers
+HYPHEN_RAIL_ENTITY_RE = re.compile(
+    r"^\s*(?:NEFT|RTGS|IMPS)(?:\s+RETURN)?-[A-Z0-9]*\d{5,}[A-Z0-9]*-([^-]+)",
+    flags=re.IGNORECASE,
+)
+CHEQUE_ENTITY_RE = re.compile(r"^\s*(?:CLG|TRF)/([^/]+)/", flags=re.IGNORECASE)
+INFT_ENTITY_RE = re.compile(r"^\s*(?:INF|BIL)/INFT/[^/]*\d[^/]*/(.*)$", flags=re.IGNORECASE)
+MMT_IMPS_ENTITY_RE = re.compile(r"^\s*MMT/IMPS/\d{6,}/[^/]*/([^/]+)", flags=re.IGNORECASE)
+INTERNAL_TRANSFER_ENTITY_RE = re.compile(r"^\s*TRFR\s+(?:TO|FROM)\s*:\s*(.+)$", flags=re.IGNORECASE)
 SLASH_ENTITY_RAIL_RE = re.compile(r"\b(UPI|NEFT|IMPS|RTGS|ATM)/(.*)", flags=re.IGNORECASE)
 BBPS_BILLER_RE = re.compile(r"\bBBPS/(?:DR|CR)/([A-Z][A-Z ]*[A-Z])\d", flags=re.IGNORECASE)
 BBPS_BILLER_NAMES = {"jiofiber": "jio fiber", "tatasky": "tata sky"}
@@ -633,8 +651,77 @@ def extract_narration_entity(particulars: str) -> str:
     return ""
 
 
-def fill_specific_level6(particulars: str, result: dict[str, str]) -> dict[str, str]:
-    """Replace a blank, generic or category Level 6 with the narration's entity."""
+def _clean_layout_name(value: str) -> str:
+    """Normalise a name taken from a narration layout, or "" if it is not a name.
+
+    Reference/account numbers are dropped and leading/trailing generic words
+    are trimmed. A segment that still contains generic words in the middle
+    (e.g. "yasodhaa from va") is free-text remark, not a reliable name.
+    """
+
+    text = re.sub(r"[^a-z0-9&.\- ]+", " ", str(value or "").lower())
+    tokens = [token for token in text.split() if not token.isdigit()]
+    while tokens and re.sub(r"[^a-z0-9]", "", tokens[0]) in GENERIC_LEVEL6_WORDS:
+        tokens.pop(0)
+    while tokens and re.sub(r"[^a-z0-9]", "", tokens[-1]) in GENERIC_LEVEL6_WORDS:
+        tokens.pop()
+    name = " ".join(tokens).strip(" .-&")
+    if not name or is_generic_level6(name):
+        return ""
+    if any(word in GENERIC_LEVEL6_WORDS for word in re.findall(r"[a-z0-9]+", name)):
+        return ""
+    return name
+
+
+def extract_level6_entity(particulars: str) -> str:
+    """Return the counterparty named by the narration, for Level 6.
+
+    Uses ``extract_narration_entity`` (slash rails, BBPS billers) first, then
+    the bank layouts above. Kept separate from ``extract_narration_entity`` so
+    the Level 7 counterparty key, which calls that function, is unchanged.
+    """
+
+    entity = extract_narration_entity(particulars)
+    if entity:
+        return entity
+
+    text = str(particulars or "")
+    for pattern in (HYPHEN_RAIL_ENTITY_RE, CHEQUE_ENTITY_RE, MMT_IMPS_ENTITY_RE, INTERNAL_TRANSFER_ENTITY_RE):
+        match = pattern.match(text)
+        if match:
+            return _clean_layout_name(match.group(1))
+
+    inft = INFT_ENTITY_RE.match(text)
+    if inft:
+        segments = [segment for segment in inft.group(1).split("/") if segment.strip()]
+        return _clean_layout_name(segments[-1]) if segments else ""
+    return ""
+
+
+def _echoes_narration_part(value: str, particulars: str, part_texts: list[str] | None) -> bool:
+    """Return True when a Level 6 value is just a copy of one narration fragment."""
+
+    def norm(text: str) -> str:
+        return " ".join(re.findall(r"[a-z0-9]+", str(text or "").lower()))
+
+    target = norm(value)
+    if not target:
+        return False
+    pieces = list(part_texts or []) + re.split(r"[/|:]|-(?=\S)", str(particulars or ""))
+    return any(norm(piece) == target for piece in pieces)
+
+
+def fill_specific_level6(
+    particulars: str,
+    result: dict[str, str],
+    part_texts: list[str] | None = None,
+) -> dict[str, str]:
+    """Replace a blank, generic or category Level 6 with the narration's entity.
+
+    A specific Level 6 is kept, unless it is merely a copy of one narration
+    fragment (e.g. "inft", "trfr to adimoolam n", an MMT remark) and the
+    narration layout names the counterparty explicitly.
+    """
 
     current = result.get("Level_6", "")
     is_category = bool(current) and _normalize_compare(current) == _normalize_compare(result.get("Level_5", ""))
@@ -642,9 +729,20 @@ def fill_specific_level6(particulars: str, result: dict[str, str]) -> dict[str, 
     is_raw_biller_code = bool(biller) and re.sub(r"[^a-z0-9]", "", _normalize_compare(current)) == re.sub(
         r"[^a-z0-9]", "", biller.group(1).lower()
     )
-    if current and not is_category and not is_raw_biller_code and not is_generic_level6(current):
+    entity = extract_level6_entity(particulars)
+    is_fragment_copy = (
+        bool(entity)
+        and _normalize_compare(current) != entity
+        and _echoes_narration_part(current, particulars, part_texts)
+    )
+    if (
+        current
+        and not is_category
+        and not is_raw_biller_code
+        and not is_fragment_copy
+        and not is_generic_level6(current)
+    ):
         return result
-    entity = extract_narration_entity(particulars)
     if entity:
         result["Level_6"] = entity
     elif is_category:
@@ -667,8 +765,13 @@ def derive_direction_from_amounts(debit_value: object, credit_value: object) -> 
 def _apply_transaction_rules(
     result: dict[str, str],
     default_p2p_purpose: bool = True,
+    confirmed_level6: str = "",
 ) -> dict[str, str]:
-    """Apply row-level consistency rules after aggregation."""
+    """Apply row-level consistency rules after aggregation.
+
+    ``confirmed_level6`` is a counterparty the narration layout names
+    explicitly; it survives the institution rule below.
+    """
 
     if default_p2p_purpose and result["Level_3"] == "p2p" and not result["Level_5"]:
         result["Level_5"] = "p2p transfer"
@@ -680,7 +783,13 @@ def _apply_transaction_rules(
         result["Level_5"] = ""
         result["Level_6"] = ""
 
-    if result["Level_3"] == "institution" and result["Level_4"]:
+    # For an institution row Level 6 usually repeats the bank, so it is cleared,
+    # unless the narration names a different counterparty (e.g. "BLUE APPARELS").
+    if (
+        result["Level_3"] == "institution"
+        and result["Level_4"]
+        and not (confirmed_level6 and _normalize_compare(result["Level_6"]) == confirmed_level6)
+    ):
         result["Level_6"] = ""
 
     if (
@@ -691,6 +800,36 @@ def _apply_transaction_rules(
         result["Level_6"] = ""
 
     return result
+
+
+# Four-letter IFSC bank codes. A narration part made of one of these (e.g. the
+# UTR prefix "HDFCN" = HDFC + NEFT, "KVBLR" = Karur Vysya + RTGS, or a full
+# IFSC "HDFC0001304") names the bank the money moved through, not the
+# counterparty.
+BANK_IFSC_CODES = frozenset(
+    {alias for aliases in BANK_ALIASES.values() for alias in aliases if re.fullmatch(r"[a-z]{4}", alias)}
+    | {code for code in IFSC_PREFIX_TO_BANK if len(code) == 4}
+    | {"fdrl", "idfb", "kkbk", "barb", "ibkl", "ucba", "indb", "ratn", "cosb", "jaka", "csbk", "dlxb"}
+)
+BANK_NAME_WORDS = frozenset(
+    {word for aliases in BANK_ALIASES.values() for alias in aliases for word in alias.split()}
+    | {"bank", "ltd", "limited", "the", "co", "op", "coop", "cooperative", "of", "and"}
+)
+
+
+def is_bank_only_part(part_text: str) -> bool:
+    """Return True when a narration part names only a bank (code, IFSC, UTR prefix or name)."""
+
+    compact = re.sub(r"[^a-z0-9]", "", str(part_text or "").lower())
+    if not compact:
+        return False
+    if compact[:4] in BANK_IFSC_CODES and re.fullmatch(r"[a-z]{4}(?:[a-z]?\d{6,}|[a-z]?|0[a-z0-9]{6})", compact):
+        return True
+    detected = detect_level_4_platform_or_bank(part_text)
+    if not detected or is_payment_intermediary_label(detected):
+        return False
+    words = re.findall(r"[a-z0-9]+", str(part_text).lower())
+    return all(word in BANK_NAME_WORDS for word in words)
 
 
 def aggregate_part_predictions(
@@ -704,6 +843,30 @@ def aggregate_part_predictions(
             level_name = f"Level_{level_index}"
             if not result[level_name] and prediction.get(level_name):
                 result[level_name] = prediction[level_name]
+
+    # Level 3: a part that only names a bank (e.g. the UTR prefix "HDFCN") says
+    # which bank moved the money, not who the counterparty is. If it supplied
+    # "institution", use the counterparty type from a later part that names an
+    # actual payer/payee (e.g. "BLUE APPARELS" -> merchant), when one exists.
+    first_level3 = next(
+        ((part_text, prediction) for part_text, prediction in part_predictions if prediction.get("Level_3")),
+        None,
+    )
+    if (
+        first_level3
+        and first_level3[1]["Level_3"] == "institution"
+        and is_bank_only_part(first_level3[0])
+    ):
+        counterparty_level3 = next(
+            (
+                prediction["Level_3"]
+                for part_text, prediction in part_predictions
+                if prediction.get("Level_3") and not is_bank_only_part(part_text)
+            ),
+            "",
+        )
+        if counterparty_level3:
+            result["Level_3"] = counterparty_level3
 
     specific_level6 = next(
         (
@@ -970,7 +1133,7 @@ def apply_raw_transaction_overrides(
             result["Level_5"] = ""
 
     if SALARY_KEYWORDS.search(text) and not is_debit:
-        entity = extract_narration_entity(text)
+        entity = extract_level6_entity(text)
         if not entity:
             entity = SALARY_KEYWORDS.sub("", text)
             entity = re.sub(r"[\-/|]+", " ", entity)
@@ -1010,9 +1173,13 @@ def apply_raw_transaction_overrides(
         if result.get("Level_5") == "p2p transfer":
             result["Level_5"] = ""
 
-    fill_specific_level6(text, result)
+    fill_specific_level6(text, result, part_texts)
 
-    return _apply_transaction_rules(result, default_p2p_purpose=not automated_debit)
+    return _apply_transaction_rules(
+        result,
+        default_p2p_purpose=not automated_debit,
+        confirmed_level6=extract_level6_entity(text),
+    )
 
 
 def apply_atm_withdrawal_overrides(
@@ -1045,7 +1212,7 @@ def apply_atm_withdrawal_overrides(
         ):
             location = prediction["Level_6"]
     if not location or is_generic_level6(location):
-        location = extract_narration_entity(particulars) or location
+        location = extract_level6_entity(particulars) or location
 
     result["Level_1"] = "cash"
     result["Level_3"] = ""
@@ -1325,7 +1492,7 @@ def detect_salary(df: pd.DataFrame) -> pd.DataFrame:
 
     salary_mask = output_df["IsSalary"].eq(1)
     salary_entity = output_df["Particulars"].astype(str).map(
-        lambda text: extract_narration_entity(text) or extract_salary_entity(text)
+        lambda text: extract_level6_entity(text) or extract_salary_entity(text)
     )
     output_df.loc[salary_mask, "Level_0"] = "credit"
     # Level_1 is the payment rail (rtgs/neft/imps/cheque...); salary is a
