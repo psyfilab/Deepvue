@@ -36,12 +36,35 @@ MIN_SALARY = 10_000
 MIN_SALARY_MONTHS = 2
 SALARY_DAY_STD_MAX = 7
 SLASH_UPI_RE = re.compile(
-    r"\bUPI\b(?:/\d+)?/(?:DR|CR)(?:/\d+)?/([^/\d\-][^/]{1,19})/([A-Z]{2,6})/(\S+)",
+    # \s* around the bank code: statements wrap long narrations, leaving a stray
+    # space (e.g. ".../Flipkart/ YESB/paytm-5650/...").
+    r"\bUPI\b(?:/\d+)?/(?:DR|CR)(?:/\d+)?/([^/\d\-][^/]{1,19})/\s*([A-Z]{2,6})\s*/(\S+)",
     flags=re.IGNORECASE,
 )
 # Payee names that carry no identity. A slash-format UPI row whose payee is one
 # of these gives no evidence of a person, so it is not asserted to be P2P.
 UPI_PLACEHOLDER_PAYEES = frozenset({"unknown", "na", "nil", "null", "none"})
+# UPI IDs issued only to merchants: PhonePe business QR codes (Q + digits @ybl,
+# @ibl, @axl), BharatPe merchant IDs and Paytm QR IDs (paytmqr...). Matched on
+# the narration with spaces removed, because statements wrap long IDs
+# ("BHARATPE0991555 5394@YESBANKLTD").
+MERCHANT_VPA_RE = re.compile(
+    r"(?:^|[-/])(?:q\d{6,}@(?:ybl|ibl|axl)|bharatpe[a-z0-9.]*@|paytmqr[a-z0-9]*@)",
+    flags=re.IGNORECASE,
+)
+# "paytm-<digits>@paytm" is treated as a merchant only together with a
+# merchant order id ("...-OID202404010903130"); on its own it may be personal.
+PAYTM_NUMERIC_VPA_RE = re.compile(r"(?:^|[-/])paytm-?\d+@paytm", flags=re.IGNORECASE)
+MERCHANT_ORDER_ID_RE = re.compile(r"\bOID\d{6,}", flags=re.IGNORECASE)
+
+
+def has_merchant_vpa(particulars: str) -> bool:
+    """Return True when the narration's UPI ID is a merchant-only ID."""
+
+    compact = re.sub(r"\s+", "", str(particulars or ""))
+    if MERCHANT_VPA_RE.search(compact):
+        return True
+    return bool(PAYTM_NUMERIC_VPA_RE.search(compact) and MERCHANT_ORDER_ID_RE.search(compact))
 MERCHANT_MARKER_RE = re.compile(
     r"(?:^|[/|])\s*MERCHANT\s*(?:[/|]|$)",
     flags=re.IGNORECASE,
@@ -257,9 +280,9 @@ BANK_ALIASES = {
     "hdfc bank": ("hdfc bank", "hdfc"),
     "icici bank": ("icici bank", "icici"),
     "axis bank": ("axis bank", "axis", "utib"),
-    "kotak mahindra bank": ("kotak mahindra bank", "kotak bank", "kotak"),
+    "kotak mahindra bank": ("kotak mahindra bank", "kotak bank", "kotak", "kkbk"),
     "punjab national bank": ("punjab national bank", "pnb", "punb"),
-    "bank of baroda": ("bank of baroda", "bob"),
+    "bank of baroda": ("bank of baroda", "bob", "barb"),
     "bank of india": ("bank of india", "boi"),
     "canara bank": ("canara bank", "canara", "cnrb"),
     "union bank of india": ("union bank of india", "union bank", "ubin"),
@@ -270,11 +293,11 @@ BANK_ALIASES = {
     "bank of maharashtra": ("bank of maharashtra", "mahabank", "mahb"),
     "punjab and sind bank": ("punjab and sind bank", "psb", "psib"),
     "yes bank": ("yes bank", "yesb"),
-    "idfc first bank": ("idfc first bank", "idfc bank", "idfc"),
+    "idfc first bank": ("idfc first bank", "idfc bank", "idfc", "idfb"),
     "indusind bank": ("indusind bank", "indusind", "inbk"),
-    "federal bank": ("federal bank", "federal", "fdr"),
+    "federal bank": ("federal bank", "federal", "fdr", "fdrl"),
     "bandhan bank": ("bandhan bank", "bandhan", "bdbl"),
-    "rbl bank": ("rbl bank", "rbl"),
+    "rbl bank": ("rbl bank", "rbl", "ratn"),
     "south indian bank": ("south indian bank", "sib", "sibl"),
     "karnataka bank": ("karnataka bank", "ktkb"),
     "city union bank": ("city union bank", "ciub"),
@@ -282,6 +305,8 @@ BANK_ALIASES = {
     "dcb bank": ("dcb bank", "dcb"),
     "tamilnad mercantile bank": ("tamilnad mercantile bank", "tmb", "tmbl"),
     "au small finance bank": ("au small finance bank", "au bank", "aubl"),
+    "idbi bank": ("idbi bank", "idbi", "ibkl"),
+    "cosmos co-operative bank": ("cosmos co-operative bank", "cosmos bank", "cosb"),
     "equitas small finance bank": ("equitas small finance bank", "equitas", "esfb"),
     "ujjivan small finance bank": ("ujjivan small finance bank", "ujjivan", "usfb"),
     "jana small finance bank": ("jana small finance bank", "jana", "jsfb"),
@@ -489,8 +514,15 @@ NARRATION_LEVEL5_PATTERNS: list[tuple[re.Pattern[str], str]] = [
     ),
     (
         re.compile(
+            r"\b(?:bookmyshow|pvr|inox|cinepolis|paytm\s*insider|district)\b",
+            re.IGNORECASE,
+        ),
+        "entertainment",
+    ),
+    (
+        re.compile(
             r"\b(?:netflix|spotify|hotstar|primevideo|youtube\s*premium"
-            r"|jiocinema|zee5|sonyliv|voot|mxplayer|bookmyshow"
+            r"|jiocinema|zee5|sonyliv|voot|mxplayer"
             r"|subscription|annual\s*plan)\b",
             re.IGNORECASE,
         ),
@@ -1173,6 +1205,13 @@ def apply_raw_transaction_overrides(
         if result.get("Level_5") == "p2p transfer":
             result["Level_5"] = ""
 
+    # A merchant-only UPI ID (PhonePe business QR, BharatPe, Paytm merchant) is
+    # direct evidence of a merchant payment, whatever the payee name looks like.
+    if has_merchant_vpa(text) and result.get("Level_3") != "institution":
+        result["Level_3"] = "merchant"
+        if result.get("Level_5") == "p2p transfer":
+            result["Level_5"] = ""
+
     fill_specific_level6(text, result, part_texts)
 
     return _apply_transaction_rules(
@@ -1198,30 +1237,95 @@ def apply_atm_withdrawal_overrides(
         return result
 
     bank_name = result["Level_4"]
-    location = result["Level_6"]
     if not bank_name:
         bank_name = detect_level_4_platform_or_bank(text)
     for _, prediction in part_predictions:
         if not bank_name and prediction.get("Level_4"):
             bank_name = prediction["Level_4"]
-        if (
-            (not location or is_generic_level6(location))
-            and prediction.get("Level_6")
-            and not is_generic_level6(prediction["Level_6"])
-            and prediction.get("Level_3") != "p2p"
-        ):
-            location = prediction["Level_6"]
-    if not location or is_generic_level6(location):
-        location = extract_level6_entity(particulars) or location
 
     result["Level_1"] = "cash"
     result["Level_3"] = ""
     result["Level_5"] = ""
     result["Level_4"] = bank_name
-    result["Level_6"] = location
-    if bank_name and location and _normalize_compare(bank_name) == _normalize_compare(location):
-        result["Level_6"] = ""
+    # Level 6 is a brand or person. A cash withdrawal has neither: the ATM
+    # ("ICICI BANK ATM") is the bank, already in Level 4, and terminal or
+    # location codes ("S1AWMN16-KULLU") are not entities.
+    result["Level_6"] = ""
 
+    return result
+
+
+# Level 3 evidence that the counterparty cannot be a person.
+#   Bank charges: "RTN CHG-...", "IMPS Chg May-25+GST", "Chq rtn Chg ..."
+BANK_CHARGE_RE = re.compile(r"^\s*(?:[a-z]+\s+){0,3}(?:chg|chgs|charges?)\b", flags=re.IGNORECASE)
+#   Government payee: ".../CHALLAN 280 TAX/GOVT/", ".../PF CONTRIBUTION/GOVT/"
+GOVERNMENT_PAYEE_RE = re.compile(r"(?:^|/)\s*GOVT\s*(?:/|$)|\bCHALLAN\b", flags=re.IGNORECASE)
+#   Mandate debits (NACH / ECS / auto-debit / standing instruction). Mandates are
+#   registered by institutions and companies, never by an individual.
+MANDATE_DEBIT_RE = re.compile(
+    r"\b(?:NACH|ECS|ACH|ACHDR|AUTO[\s-]?DEBIT|AUTODEBIT|AUTO[\s-]?PAY|AUTOPAY|"
+    r"STANDING\s+INSTRUCTION|SI[\s-]?(?:DEBIT|MAD)|UPI\s+MANDATE|MANDATE)\b",
+    flags=re.IGNORECASE,
+)
+#   Bulk corporate credits ("ACH C- TCSFINDIV...", "ACH C- IRFC LTD-..."):
+#   dividends, interest and refunds paid by companies, never by a person.
+BULK_CORPORATE_CREDIT_RE = re.compile(r"\b(?:ACH|NACH)\s*CR?\b", flags=re.IGNORECASE)
+INSTITUTIONAL_PURPOSE_RE = re.compile(
+    r"\b(?:loan|emi|sip|mutual\s*fund|mf|insurance|premium|policy|credit\s*card|cc|tax|challan|gst)\b",
+    flags=re.IGNORECASE,
+)
+INSTITUTIONAL_LEVEL5 = frozenset(
+    {"loan repayment", "credit card", "insurance", "financial services", "investment", "tax", "dividend"}
+)
+
+
+def apply_counterparty_type_override(
+    particulars: str,
+    result: dict[str, str],
+    debit_value: object = None,
+    credit_value: object = None,
+    part_texts: list[str] | None = None,
+) -> dict[str, str]:
+    """Correct a P2P (or blank) Level 3 when the narration shows a non-person counterparty.
+
+    - bank charges -> institution (the bank)
+    - government payee (GOVT / CHALLAN) -> institution
+    - mandate debit (NACH/ECS/auto-debit/SI) labelled p2p -> institution when the
+      purpose is institutional (loan, EMI, SIP, insurance, card, tax), otherwise
+      blank: a mandate is never person-to-person, but the type is not stated.
+    - ACH/NACH credit -> institution (a company's dividend/interest payout).
+    A merchant or institution label already on the row is never changed. When
+    Level 3 stops being p2p, a "p2p transfer" purpose is removed.
+    """
+
+    level_3 = result.get("Level_3", "")
+    if level_3 not in {"p2p", ""}:
+        return result
+
+    text = str(particulars or "")
+    marker_text = _marker_text(text, part_texts)
+    direction = derive_direction_from_amounts(debit_value, credit_value)
+    is_debit = direction == "debit"
+
+    new_level_3 = None
+    if BANK_CHARGE_RE.match(text) or GOVERNMENT_PAYEE_RE.search(text):
+        new_level_3 = "institution"
+    elif direction == "credit" and BULK_CORPORATE_CREDIT_RE.search(text):
+        new_level_3 = "institution"
+    elif is_debit and MANDATE_DEBIT_RE.search(marker_text):
+        institutional = bool(INSTITUTIONAL_PURPOSE_RE.search(marker_text)) or (
+            _normalize_compare(result.get("Level_5", "")) in INSTITUTIONAL_LEVEL5
+        )
+        if institutional:
+            new_level_3 = "institution"
+        elif level_3 == "p2p":
+            new_level_3 = ""
+
+    if new_level_3 is None or new_level_3 == level_3:
+        return result
+    result["Level_3"] = new_level_3
+    if result.get("Level_5") == "p2p transfer":
+        result["Level_5"] = ""
     return result
 
 
@@ -1380,6 +1484,44 @@ def derive_first_level_classification(row: pd.Series) -> str:
         return "Investment"
     if "refund" in particulars.lower() or level_5 == "refund":
         return "Refund/Reversal"
+    return derive_first_level_fallback(particulars, level_1, level_5)
+
+
+# Fallback First Level labels, used only when none of the rules above applies.
+# Each needs explicit narration evidence; anything else stays blank.
+FIRST_LEVEL_FALLBACKS: list[tuple[re.Pattern[str], str]] = [
+    # Reversals of UPI / card transactions: "UPIRET-...", "CRV POS ..."
+    (re.compile(r"^\s*(?:UPI\s*RET|CRV\s+POS)\b", re.IGNORECASE), "Refund/Reversal"),
+    # Bank charges: "RTN CHG-...", "IMPS Chg May-25+GST", "Chq rtn Chg ..."
+    (BANK_CHARGE_RE, "Bank Charges"),
+    # Interest: "...:Int.Coll:...", "...:Int.Pd:...", "INTEREST PAID TILL ..."
+    (re.compile(r"\bInt\.\s*(?:Coll|Pd)\b|\bINTEREST\s+(?:PAID|CREDITED|COLLECTED)\b", re.IGNORECASE), "Interest"),
+    # Dividends: "DR REDDYS DIV 23 ...", "ACH C- HCL 1ST INTDIV24 ...", and codes
+    # run together with the company name ("TCSFINDIV...", "TCS3INTSPLDIV...").
+    (re.compile(r"\bDIV(?:IDEND)?S?\d*\b|(?:INT|FIN|SPL)DIV", re.IGNORECASE), "Dividend"),
+    # Card payments: "POS 416021XXXXXX3640 ...", "ME DC SI ...", "ECOM PUR/..."
+    (re.compile(r"^\s*(?:POS|ME\s+DC\s+SI|ECOM\s+PUR)\b", re.IGNORECASE), "Card Payment"),
+    # International remittances: ".../INTL/DR/.../INTL TRANSFER-"
+    (re.compile(r"\bINTL\s*/|\bINTL\s+TRANSFER\b", re.IGNORECASE), "International Transfer"),
+    # In-bank / net-banking / mobile-banking fund transfers.
+    (
+        re.compile(
+            r"^\s*(?:(?:INF|BIL)/INFT/|TRFR\s+(?:TO|FROM)\b|TRF/|IFT/|INB/IFT/|MOB/TPFT/|IB\s+FUNDS\s+TRANSFER\b)",
+            re.IGNORECASE,
+        ),
+        "Fund Transfer",
+    ),
+]
+
+
+def derive_first_level_fallback(particulars: str, level_1: str = "", level_5: str = "") -> str:
+    """Return a First Level label for rows the main mapping leaves blank."""
+
+    if level_1 in {"nach", "auto-debit"}:
+        return "ECS/NACH Payment"
+    for pattern, label in FIRST_LEVEL_FALLBACKS:
+        if pattern.search(str(particulars or "")):
+            return label
     return ""
 
 
@@ -1950,6 +2092,13 @@ class BankStatementClassifier:
                 row_prediction,
                 output_df.loc[row_index, "Debit"],
                 output_df.loc[row_index, "Credit"],
+            )
+            row_prediction = apply_counterparty_type_override(
+                str(output_df.loc[row_index, "Particulars"]),
+                row_prediction,
+                output_df.loc[row_index, "Debit"],
+                output_df.loc[row_index, "Credit"],
+                [part_text for part_text, _ in row_parts],
             )
             row_prediction = apply_initiation_mode_override(
                 str(output_df.loc[row_index, "Particulars"]),

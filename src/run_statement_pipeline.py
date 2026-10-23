@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import argparse
 import logging
+import shutil
 import sys
+import tempfile
 from pathlib import Path
 
 import pandas as pd
@@ -61,31 +63,45 @@ def write_output(
         salary_window_txn_df.to_csv(salary_txn_path, index=False)
         return
 
-    with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
-        split_df.to_excel(writer, sheet_name="Split", index=False)
-        unique_df.to_excel(writer, sheet_name="Unique_Keywords", index=False)
-        classified_df.to_excel(writer, sheet_name="Classified", index=False)
-        salary_summary_df.to_excel(writer, sheet_name="Salary_Summary", index=False)
-        salary_window_summary_df.to_excel(
-            writer,
-            sheet_name="Salary_Window_Summary",
-            index=False,
-        )
-        salary_window_txn_df.to_excel(
-            writer,
-            sheet_name="Salary_Window_Txns",
-            index=False,
-        )
+    # Write to a local /tmp file first to avoid iCloud/network-sync daemon
+    # timeouts (errno 60) that occur when openpyxl's zipfile seeks on a
+    # cloud-synced path.  Then move the finished file to the real destination.
+    with tempfile.NamedTemporaryFile(
+        suffix=".xlsx", delete=False, dir=tempfile.gettempdir()
+    ) as tmp:
+        tmp_path = Path(tmp.name)
 
-        for sheet_name in (
-            "Split",
-            "Unique_Keywords",
-            "Classified",
-            "Salary_Summary",
-            "Salary_Window_Summary",
-            "Salary_Window_Txns",
-        ):
-            autofit_worksheet(writer.sheets[sheet_name])
+    try:
+        with pd.ExcelWriter(tmp_path, engine="openpyxl") as writer:
+            split_df.to_excel(writer, sheet_name="Split", index=False)
+            unique_df.to_excel(writer, sheet_name="Unique_Keywords", index=False)
+            classified_df.to_excel(writer, sheet_name="Classified", index=False)
+            salary_summary_df.to_excel(writer, sheet_name="Salary_Summary", index=False)
+            salary_window_summary_df.to_excel(
+                writer,
+                sheet_name="Salary_Window_Summary",
+                index=False,
+            )
+            salary_window_txn_df.to_excel(
+                writer,
+                sheet_name="Salary_Window_Txns",
+                index=False,
+            )
+
+            for sheet_name in (
+                "Split",
+                "Unique_Keywords",
+                "Classified",
+                "Salary_Summary",
+                "Salary_Window_Summary",
+                "Salary_Window_Txns",
+            ):
+                autofit_worksheet(writer.sheets[sheet_name])
+
+        shutil.move(str(tmp_path), str(output_path))
+    except Exception:
+        tmp_path.unlink(missing_ok=True)
+        raise
 
 
 def parse_args() -> argparse.Namespace:
