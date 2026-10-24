@@ -37,7 +37,7 @@ The splitter preserves important transaction markers like `P2M`, `P2A`, `P2P`, `
 
 Main file:
 
-- [statement_splitter.py](c:/Users/DELL/OneDrive/Desktop/PSYFI/Deepvue/src/statement_splitter.py)
+- [statement_splitter.py](src/statement_splitter.py)
 
 ### 2. Keyword-Level Classification
 
@@ -53,9 +53,9 @@ This means if a keyword already exists in the codebook, the classifier prefers t
 
 Main files:
 
-- [predict.py](c:/Users/DELL/OneDrive/Desktop/PSYFI/Deepvue/src/predict.py)
-- [prompt_part3.py](c:/Users/DELL/OneDrive/Desktop/PSYFI/Deepvue/src/prompt_part3.py)
-- [rule_engine.py](c:/Users/DELL/OneDrive/Desktop/PSYFI/Deepvue/src/rule_engine.py)
+- [predict.py](src/predict.py)
+- [prompt_part3.py](src/prompt_part3.py)
+- [rule_engine.py](src/rule_engine.py)
 
 ### 3. Rule-Driven Levels
 
@@ -67,6 +67,31 @@ The deterministic levels are handled by rules instead of ML because they are exp
 - `Level_7`: recurring indicators like `EMI`, `SI`, `monthly`
 
 At the statement-row level, `Level_0` is further strengthened by directly reading the actual `Debit` and `Credit` columns from the input statement.
+
+### Classification Level Taxonomy (Level 0 – 7)
+
+Every classified row carries eight structured fields. The table below shows what each level means, how it is determined, and its key values:
+
+| Level | Name | Determined by | Key values / description |
+|-------|------|--------------|---------------------------|
+| `Level_0` | **Direction** | Rule — debit/credit columns | `debit` · `credit` |
+| `Level_1` | **Rail / Channel** | Rule + narration prefix | `upi` · `neft` · `rtgs` · `imps` · `cash` · `cheque` · `nach` · `ach` · `wallet` |
+| `Level_2` | **Initiation mode** | Rule + narration markers | `User-generated` · `System generated` |
+| `Level_3` | **Counterparty type** | ML + deterministic overrides | `merchant` · `p2p` · `institution` · *(blank)* |
+| `Level_4` | **Platform / Bank** | Alias lookup + narration | e.g. `hdfc bank` · `google pay` · `phonepe` · `razorpay` |
+| `Level_5` | **Purpose / Category** | ML + narration override patterns | `salary` · `loan repayment` · `credit card` · `dining` · `grocery` · `utilities` · `insurance` · `dividend` · `charges` · `wallet load` · `wallet unload` · … |
+| `Level_6` | **Counterparty name** | Narration entity extraction | Payee/payer name, BBPS biller, company name, or blank |
+| `Level_7` | **Recurrence** | Statistical cadence detection + explicit instruction markers | `recurring` · `one-time` |
+
+**Override priority (highest → lowest)**
+
+1. Explicit narration markers (ATM, MERCHANT tag, UPI P2M/P2A)
+2. Structured UPI split overrides (P2M → merchant, P2A → p2p)
+3. Merchant VPA detection (PhonePe QR, BharatPe, Paytm QR)
+4. Pre-salary structural overrides (RTN CHG, ACH+DIV, Int.Coll, DRP wallet, business-word payees)
+5. Counterparty type override (NACH/ECS/GOVT/ACH bulk credits → institution)
+6. ML model prediction
+7. Narration pattern fallback
 
 ### 4. ML Fallback
 
@@ -104,7 +129,7 @@ This prevents the system from treating the full narration as one flat string and
 
 Main file:
 
-- [statement_classifier.py](c:/Users/DELL/OneDrive/Desktop/PSYFI/Deepvue/src/statement_classifier.py)
+- [statement_classifier.py](src/statement_classifier.py)
 
 ### 6. Salary Detection
 
@@ -358,18 +383,20 @@ expenditure = exp_food + exp_micro + exp_luxury + exp_ecomm +
 
 ## Known Limitations
 
-- Salary detection can still over-trigger on some repeated high-value credits
 - Unknown keyword review is intentionally conservative and may over-flag borderline cases
-- `Level_3` remains the hardest level in noisy, unseen cases
-- quality is still bottlenecked by the quality of labels in `MASTER_SHEET.csv`
+- `Level_3` remains the hardest level in noisy, unseen cases; short unseen names are ambiguous between person and merchant
+- Quality is still bottlenecked by the quality of labels in `MASTER_SHEET.csv`
+- Salary detection now requires a keyword hit or ≥ 3 distinct calendar months of the same sender; a true employer who pays only twice may be missed (conservative trade-off against false positives)
+- BBPS biller aliases cover only the most common codes; uncommon billers will show the raw code in `Level_6`
 
 ## Best Next Improvements
 
-1. Tighten salary false positives with stronger salary-entity rules.
-2. Improve merchant vs person discrimination for unseen short names.
-3. Add a faster keyword approval pipeline from `Unknown_Keywords` back into `MASTER_SHEET.csv`.
-4. Add confidence calibration reports for `Level_3` and `Level_5`.
+1. Improve merchant vs person discrimination for unseen short names (the core remaining `Level_3` gap).
+2. Add a faster keyword approval pipeline from `Unknown_Keywords` back into `MASTER_SHEET.csv`.
+3. Add confidence calibration reports for `Level_3` and `Level_5`.
+4. Expand BBPS biller alias coverage as new billers are encountered.
 5. Improve versioned output folder handling for reports and plots.
+6. Add Level 4 coverage for newer UPI handles and payment intermediaries.
 
 ## Attribution
 
