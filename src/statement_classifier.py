@@ -638,8 +638,17 @@ INFT_ENTITY_RE = re.compile(r"^\s*(?:INF|BIL)/INFT/[^/]*\d[^/]*/(.*)$", flags=re
 MMT_IMPS_ENTITY_RE = re.compile(r"^\s*MMT/IMPS/\d{6,}/[^/]*/([^/]+)", flags=re.IGNORECASE)
 INTERNAL_TRANSFER_ENTITY_RE = re.compile(r"^\s*TRFR\s+(?:TO|FROM)\s*:\s*(.+)$", flags=re.IGNORECASE)
 SLASH_ENTITY_RAIL_RE = re.compile(r"\b(UPI|NEFT|IMPS|RTGS|ATM)/(.*)", flags=re.IGNORECASE)
-BBPS_BILLER_RE = re.compile(r"\bBBPS/(?:DR|CR)/([A-Z][A-Z ]*[A-Z])\d", flags=re.IGNORECASE)
+# Allow digits inside the biller code (e.g. "BBPS/DR/MCGMWATE1234").
+BBPS_BILLER_RE = re.compile(r"\bBBPS/(?:DR|CR)/([A-Z][A-Z0-9 ]*[A-Z0-9])\d", flags=re.IGNORECASE)
 BBPS_BILLER_NAMES = {"jiofiber": "jio fiber", "tatasky": "tata sky"}
+# Aliases for well-known BBPS biller codes that appear verbatim in narrations.
+BBPS_BILLER_ALIASES: dict[str, str] = {
+    "d2hme": "d2h",
+    "maxlifei": "max life insurance",
+    "mcgmwate": "mcgm water",
+    "sbilife": "sbi life",
+    "lic": "lic of india",
+}
 
 
 def is_generic_level6(value: str) -> bool:
@@ -659,9 +668,10 @@ def extract_narration_entity(particulars: str) -> str:
     biller = BBPS_BILLER_RE.search(text)
     if biller:
         code = re.sub(r"\s+", " ", biller.group(1)).strip().lower()
+        compact_code = re.sub(r"\s+", "", code)
         if code.endswith("cc") and any(code[:-2] in aliases for aliases in BANK_ALIASES.values()):
             return f"{code[:-2]} credit card"
-        return BBPS_BILLER_NAMES.get(code, code)
+        return BBPS_BILLER_ALIASES.get(compact_code, BBPS_BILLER_NAMES.get(code, code))
 
     rail = SLASH_ENTITY_RAIL_RE.search(text)
     if not rail:
@@ -1540,8 +1550,146 @@ def derive_second_level_classification(row: pd.Series) -> str:
     return level_3.title() if level_3 else ""
 
 
+# ---------------------------------------------------------------------------
+# Pre-detect-salary overrides (rules 1-6 from the 2024-10-24 spec)
+# ---------------------------------------------------------------------------
+# Rule 1: "RTN CHG" rows (bank charge return).
+RTN_CHG_RE = re.compile(r"^\s*(?:RTN\s+CHG|RETURN\s+CHARGE)\b", flags=re.IGNORECASE)
+# Rule 2: ACH credit with a dividend keyword.
+ACH_CR_DIV_RE = re.compile(r"\b(?:ACH|NACH)\s*C(?:R|REDIT)?\b", flags=re.IGNORECASE)
+DIV_KEYWORD_RE = re.compile(r"\bDIV(?:IDEND)?S?\b|(?:INT|FIN|SPL)DIV", flags=re.IGNORECASE)
+# Rule 3: Interest credit rows.
+INT_COLL_RE = re.compile(
+    r"\bInt\.\s*(?:Coll|Pd)\b|\bINTEREST\s+(?:PAID|CREDITED|COLLECTED)\b",
+    flags=re.IGNORECASE,
+)
+# Rule 4: DRP wallet load/unload.
+DRP_WALLET_RE = re.compile(r"^\s*DRP/", flags=re.IGNORECASE)
+DRP_LOAD_RE = re.compile(r"\bLoad\b", flags=re.IGNORECASE)
+DRP_UNLOAD_RE = re.compile(r"\bUnLoad\b", flags=re.IGNORECASE)
+# Rule 5: Business-name words that disqualify a CLG/NEFT/RTGS/IMPS/TRF payee from salary.
+BUSINESS_WORD_RE = re.compile(
+    r"\b(?:LTD|LIMITED|PVT|PRIVATE|TRADING|ENTERPRISES?|CONSTRUCTION|CORPO(?:RATE)?|"
+    r"TEXTILES?|FINANCE|FINANCIALS?|SOCIETY|STORES?|INDUSTRIES|INFRA(?:STRUCTURE)?|"
+    r"EXPORTS?|IMPORTS?|BUILDERS?|DEVELOPERS?|REALTORS?|ASSOCIATES?)\b",
+    flags=re.IGNORECASE,
+)
+BUSINESS_RAIL_RE = re.compile(r"^\s*(?:CLG|NEFT|RTGS|IMPS|TRF)/", flags=re.IGNORECASE)
+# Rule 6: Generic Level-6 values that should be blanked.
+GENERIC_LEVEL6_EXACT: frozenset[str] = frozenset({
+    "unload", "load", "funds insufficient", "exceeds arrangement",
+    "inft", "upiret", "ib funds transfer dr", "ib billpay dr",
+})
+
+# Narration prefixes that should never be promoted to salary by detect_salary.
+_SALARY_EXCLUSION_RE = re.compile(
+    r"^\s*(?:CLG|TRF|DRP|NEFT|RTGS)/"
+    r"|\bUPI\b.*\bP2A\b"
+    r"|\bATW(?![A-Za-z])\b",
+    flags=re.IGNORECASE,
+)
+
+
+def _company_name_in_narration(text: str) -> bool:
+    """Return True when the narration contains a business-word on a transfer rail."""
+    return bool(BUSINESS_RAIL_RE.search(text) and BUSINESS_WORD_RE.search(text))
+
+
+def apply_pre_detect_salary_overrides(df: pd.DataFrame) -> pd.DataFrame:
+    """Apply structural overrides to output_df before detect_salary runs.
+
+    Rules applied in order (a later rule can overwrite an earlier one only
+    when a row matches multiple patterns, which is rare):
+
+    1. RTN CHG -> Level_1=cheque, Level_3=institution, Level_5=charges,
+       Level_6="bank charges".
+    2. ACH C + DIV -> Level_1=ach, Level_3=institution, Level_5=dividend,
+       Level_6=company extracted from narration (or blank).
+    3. Int.Coll / INTEREST PAID -> Level_3=institution, Level_5=interest,
+       Level_6="".
+    4. DRP/Load -> Level_1=wallet, Level_3=institution,
+       Level_5=wallet load/unload, Level_6="".
+    5. CLG/NEFT/RTGS/IMPS/TRF with business-word payee -> Level_3=merchant,
+       remove p2p transfer.
+    6. Blank Level_6 when it is a known generic placeholder or contains "xxxx".
+    """
+
+    output_df = df.copy()
+    particulars = output_df["Particulars"].fillna("").astype(str)
+    level_6 = output_df["Level_6"].fillna("").astype(str)
+    credit_num = output_df["Credit"].apply(parse_amount)
+
+    for idx in output_df.index:
+        text = particulars[idx]
+        text_lo = text.lower()
+
+        # Rule 1: RTN CHG bank charge
+        if RTN_CHG_RE.match(text):
+            output_df.at[idx, "Level_1"] = "cheque"
+            output_df.at[idx, "Level_3"] = "institution"
+            output_df.at[idx, "Level_5"] = "charges"
+            output_df.at[idx, "Level_6"] = "bank charges"
+            continue
+
+        # Rule 2: ACH credit + dividend
+        if credit_num[idx] > 0 and ACH_CR_DIV_RE.search(text) and DIV_KEYWORD_RE.search(text):
+            company = extract_level6_entity(text)
+            output_df.at[idx, "Level_1"] = "ach"
+            output_df.at[idx, "Level_3"] = "institution"
+            output_df.at[idx, "Level_5"] = "dividend"
+            output_df.at[idx, "Level_6"] = company
+            continue
+
+        # Rule 3: Interest credit/collection
+        if INT_COLL_RE.search(text):
+            output_df.at[idx, "Level_3"] = "institution"
+            output_df.at[idx, "Level_5"] = "interest"
+            output_df.at[idx, "Level_6"] = ""
+            continue
+
+        # Rule 4: DRP wallet load / unload
+        if DRP_WALLET_RE.match(text):
+            output_df.at[idx, "Level_1"] = "wallet"
+            output_df.at[idx, "Level_3"] = "institution"
+            if DRP_UNLOAD_RE.search(text):
+                output_df.at[idx, "Level_5"] = "wallet unload"
+            elif DRP_LOAD_RE.search(text):
+                output_df.at[idx, "Level_5"] = "wallet load"
+            else:
+                output_df.at[idx, "Level_5"] = "wallet load"
+            output_df.at[idx, "Level_6"] = ""
+            # DRP rows must never be flagged as salary
+            output_df.at[idx, "IsSalary"] = 0
+            output_df.at[idx, "SalaryConfidence"] = 0.0
+            continue
+
+        # Rule 5: Business-name payee on a transfer rail -> merchant
+        if _company_name_in_narration(text):
+            current_l3 = str(output_df.at[idx, "Level_3"] or "")
+            if current_l3 not in {"institution"}:
+                output_df.at[idx, "Level_3"] = "merchant"
+                if str(output_df.at[idx, "Level_5"] or "") == "p2p transfer":
+                    output_df.at[idx, "Level_5"] = ""
+
+    # Rule 6: Blank generic / placeholder Level_6 values.
+    for idx in output_df.index:
+        raw_l6 = str(output_df.at[idx, "Level_6"] or "").strip().lower()
+        if raw_l6 in GENERIC_LEVEL6_EXACT or "xxxx" in raw_l6:
+            output_df.at[idx, "Level_6"] = ""
+
+    return output_df
+
+
 def detect_salary(df: pd.DataFrame) -> pd.DataFrame:
-    """Flag salary-like credits using explicit text plus recurring credits."""
+    """Flag salary-like credits using explicit text plus recurring credits.
+
+    Over-flagging guard (2024-10-24):
+    - Statistical clusters require EITHER a salary keyword hit on any member
+      OR the same sender recurring across 3 or more distinct calendar months
+      (not just 2 occurrences).
+    - CLG, DRP, TRF, UPI-P2A and business-word narrations are excluded from
+      the statistical cluster even when they pass the amount / day-std tests.
+    """
 
     output_df = df.copy()
     output_df["IsSalary"] = 0
@@ -1609,6 +1757,13 @@ def detect_salary(df: pd.DataFrame) -> pd.DataFrame:
     ]
 
     if len(candidates) >= 2:
+        # Exclude narration patterns that should never be salary.
+        exclusion_mask = output_df.loc[candidates, "Particulars"].astype(str).apply(
+            lambda t: bool(_SALARY_EXCLUSION_RE.search(t)) or _company_name_in_narration(t)
+        )
+        candidates = candidates[~exclusion_mask.values]
+
+    if len(candidates) >= 2:
         amount_keys = ((credit_num.loc[candidates] / 1000).round() * 1000).astype(int)
         clusters: dict[int, list[int]] = defaultdict(list)
         for index, amount_key in amount_keys.items():
@@ -1620,6 +1775,14 @@ def detect_salary(df: pd.DataFrame) -> pd.DataFrame:
 
             day_std = dates.loc[indices].dt.day.std(ddof=0)
             text_hit = output_df.loc[indices, "NormText"].str.contains(SALARY_KEYWORDS, na=False).any()
+
+            # Tighter gate: require a salary-keyword hit OR the same sender
+            # across at least 3 distinct calendar months.
+            distinct_months = dates.loc[indices].dt.to_period("M").nunique()
+            qualifies_by_months = distinct_months >= 3
+
+            if not text_hit and not qualifies_by_months:
+                continue
 
             score = 0.40
             score += 0.30 if (pd.notna(day_std) and day_std <= SALARY_DAY_STD_MAX) else 0.0
@@ -1802,6 +1965,23 @@ def _level7_clean_key(text: str) -> str:
     return " ".join(tokens)
 
 
+def _normalize_level7_key(key: str) -> str:
+    """Normalise a counterparty key for Level 7 grouping.
+
+    - Lowercase
+    - Remove trailing single-letter suffixes (e.g. "acme ltd n" -> "acme ltd")
+    - Prefix deduplication: if two keys share a prefix of 5+ characters,
+      the shorter one maps to the longer (done at the call-site via a
+      shared reference dict; this helper only strips trailing junk).
+    """
+
+    k = key.strip().lower()
+    # Drop a trailing single letter separated by a space (bank-statement
+    # artefact like "ramesh kumar n" or "sharma k").
+    k = re.sub(r"\s+[a-z]$", "", k).strip()
+    return k
+
+
 def level7_counterparty(particulars: object) -> str:
     """Return a normalised payee/payer identity that ignores changing references."""
 
@@ -1810,21 +1990,21 @@ def level7_counterparty(particulars: object) -> str:
         return ""
     entity = extract_narration_entity(text)
     if entity:
-        return _level7_clean_key(entity)
+        return _normalize_level7_key(_level7_clean_key(entity))
     inft = LEVEL7_INFT_RE.match(text)
     if inft:
-        return _level7_clean_key(inft.group(2))
+        return _normalize_level7_key(_level7_clean_key(inft.group(2)))
     wire = LEVEL7_WIRE_RE.match(text)
     if wire:
         for segment in re.split(r"[-/]", wire.group(1)):
-            key = _level7_clean_key(segment)
+            key = _normalize_level7_key(_level7_clean_key(segment))
             if key:
                 return key
         return ""
     clearing = LEVEL7_CLEARING_RE.match(text)
     if clearing:
-        return _level7_clean_key(clearing.group(1))
-    return _level7_clean_key(text)
+        return _normalize_level7_key(_level7_clean_key(clearing.group(1)))
+    return _normalize_level7_key(_level7_clean_key(text))
 
 
 def _level7_explicit_evidence(text: str, is_debit: bool) -> bool:
@@ -2164,6 +2344,7 @@ class BankStatementClassifier:
             axis=1,
         )
 
+        output_df = apply_pre_detect_salary_overrides(output_df)
         output_df = detect_salary(output_df)
         output_df = apply_strict_level2(output_df)
         output_df = apply_level7_recurrence(output_df)
