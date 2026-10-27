@@ -52,7 +52,19 @@ class RuleEngine:
                 ),
                 "auto-debit",
             ),
-            # 4. Explicit cash transactions
+            # 4. Bharat Bill Payment System – match bbps as a substring since
+            #    bank narrations frequently concatenate tokens (e.g. "BBPSBP",
+            #    "googlebbpsutility", "hdfc bank bbps").
+            (
+                re.compile(
+                    r"bbps"
+                    r"|bharat\s+bill\s+pay(?:ment)?"
+                    r"|bill\s+pay(?:ment)?\s+system",
+                    flags=re.IGNORECASE,
+                ),
+                "bbps",
+            ),
+            # 5. Explicit cash transactions
             (re.compile(r"\bcash\b", re.IGNORECASE), "cash"),
         )
 

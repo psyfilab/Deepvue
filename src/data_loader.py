@@ -61,10 +61,13 @@ def _normalize_level_value(value: str, column_name: str) -> str:
 
 
 def load_master(path: str) -> pd.DataFrame:
-    """Load the MASTER_SHEET CSV and normalize its label columns."""
+    """Load the MASTER_SHEET (CSV or XLSX) and normalize its label columns."""
 
-    csv_path = Path(path)
-    df = pd.read_csv(csv_path, dtype=str, keep_default_na=False)
+    master_path = Path(path)
+    if master_path.suffix.lower() in {".xlsx", ".xls"}:
+        df = pd.read_excel(master_path, dtype=str)
+    else:
+        df = pd.read_csv(master_path, dtype=str, keep_default_na=False)
     df.columns = [column.strip() for column in df.columns]
 
     missing = [column for column in REQUIRED_COLUMNS if column not in df.columns]
@@ -82,7 +85,7 @@ def load_master(path: str) -> pd.DataFrame:
         pd.to_numeric(df[COUNT_COLUMN], errors="coerce").fillna(0).astype(int)
     )
 
-    logger.info("Loaded %s rows from %s", len(df), csv_path)
+    logger.info("Loaded %s rows from %s", len(df), master_path)
     return df
 
 

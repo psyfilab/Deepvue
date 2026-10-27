@@ -12,8 +12,6 @@ from pathlib import Path
 import pandas as pd
 
 if __package__ in {None, ""}:
-    # Put the project root first so the working-tree ``src`` package is
-    # imported, not an older installed or cached copy found earlier on sys.path.
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
     from src.microsegment import Microsegmenter
     from src.salary_timeseries import build_salary_time_series, save_salary_timeline_plots
@@ -75,7 +73,17 @@ def write_output(
         with pd.ExcelWriter(tmp_path, engine="openpyxl") as writer:
             split_df.to_excel(writer, sheet_name="Split", index=False)
             unique_df.to_excel(writer, sheet_name="Unique_Keywords", index=False)
-            classified_df.to_excel(writer, sheet_name="Classified", index=False)
+            # Build a display copy of classified_df for the Classified sheet:
+            #   - drop Part_7 (not shown in the 7-part display system)
+            #   - rename Part_0..Part_6 -> Part 1..Part 7
+            # The underlying DataFrame is not modified.
+            classified_display = classified_df.copy()
+            if "Part_7" in classified_display.columns:
+                classified_display = classified_display.drop(columns=["Part_7"])
+            part_rename = {f"Part_{i}": f"Part {i + 1}" for i in range(7)}
+            part_rename = {k: v for k, v in part_rename.items() if k in classified_display.columns}
+            classified_display = classified_display.rename(columns=part_rename)
+            classified_display.to_excel(writer, sheet_name="Classified", index=False)
             salary_summary_df.to_excel(writer, sheet_name="Salary_Summary", index=False)
             salary_window_summary_df.to_excel(
                 writer,
