@@ -1,4 +1,20 @@
-"""Utilities for splitting bank statement narrations into keyword parts."""
+"""Utilities for splitting bank statement narrations into keyword parts.
+
+Part layout (Pipeline Reference, sections 6.1, 9.4 and 9.8): the narration is
+split on ``/ - *`` and digits are stripped, giving ``Part_0`` .. ``Part_7``.
+For slash-structured narrations every ``/`` segment keeps its own position, so
+the reference layout holds for every row:
+
+    TO TRANSFER | UPI | DR | <NAME> | <BANK CODE> | <UPI APP / q> | <TAG>
+       Part_0    Part_1 Part_2 Part_3    Part_4         Part_5       Part_6
+
+* The transaction reference -- the first ``/`` segment that is a reference
+  number (``506142753794``, ``N20250320065457``) -- is dropped, as in the
+  reference examples.
+* Any other ``/`` segment that is empty after stripping digits (a phone
+  number in the UPI-app slot, a cheque number) is kept as an empty part, so
+  the parts after it do not shift left.
+"""
 
 from __future__ import annotations
 
@@ -27,19 +43,53 @@ def normalize_part(part: str) -> str:
 
     value = re.sub(r"\d+", "", value)
     value = re.sub(r"\s+", " ", value).strip()
+    if not re.search(r"[A-Z]", value):
+        # Only punctuation left (e.g. "@" from "762075197@", ".." from a date).
+        return ""
     return value
 
 
+def is_reference_code(segment: str) -> bool:
+    """Return True for a transaction reference such as 506142753794 or N2025..."""
+
+    compact = re.sub(r"[^A-Z0-9]", "", str(segment or "").upper())
+    digits = sum(character.isdigit() for character in compact)
+    letters = len(compact) - digits
+    return digits >= 6 and letters <= 2
+
+
+def _reference_slots(segments: list[str]) -> set[int]:
+    """Return the index of the transaction reference (the first reference code)."""
+
+    for index, segment in enumerate(segments):
+        if is_reference_code(segment):
+            return {index}
+    return set()
+
+
 def split_narration(text: str, max_parts: int = 8) -> list[str]:
-    """Split a raw narration into stable uppercase parts."""
+    """Split a raw narration into position-stable uppercase parts."""
 
     value = "" if text is None else str(text).upper()
     value = re.sub(r"\bTO\s+TRANSFER\s*-", "TO TRANSFER/", value)
     value = re.sub(r"\bBY\s+TRANSFER\s*-", "BY TRANSFER/", value)
 
-    raw_parts = re.split(r"[/\-*]", value)
-    parts = [normalize_part(part) for part in raw_parts]
-    parts = [part for part in parts if part]
+    segments = value.split("/")
+    reference_slots = _reference_slots(segments) if len(segments) > 1 else set()
+
+    parts: list[str] = []
+    for index, segment in enumerate(segments):
+        if index in reference_slots:
+            continue
+        pieces = [normalize_part(piece) for piece in re.split(r"[\-*]", segment)]
+        pieces = [piece for piece in pieces if piece]
+        if pieces:
+            parts.extend(pieces)
+        elif len(segments) > 1:
+            parts.append("")  # keep the slot so later parts stay in position
+
+    while parts and not parts[-1]:
+        parts.pop()
     return parts[:max_parts]
 
 
