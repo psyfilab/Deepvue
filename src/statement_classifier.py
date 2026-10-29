@@ -24,6 +24,51 @@ else:  # pragma: no cover - used by IDEs or scripts loading this file directly
 logger = logging.getLogger(__name__)
 
 PART_COLUMNS = tuple(f"Part_{index}" for index in range(8))
+
+# ---------------------------------------------------------------------------
+# Who decides each level (the single place that states the order of decisions)
+# ---------------------------------------------------------------------------
+# "code"   -> narration rules decide first. A Master Sheet / keyword-model value
+#             never overrides them.
+# "master" -> the keyword model (Master Sheet) decides first. Code only cleans up
+#             a contradiction or fills a blank, except in the code-wins cases
+#             named in the second field.
+# A level that nothing decides stays blank.
+LEVEL_DECISION_ORDER: dict[str, tuple[str, str]] = {
+    "Level_0": ("code", "Debit/Credit columns (apply_amount_direction_override)."),
+    "Level_1": (
+        "code",
+        "ATM/cash (apply_atm_withdrawal_overrides), cheque instruments "
+        "(apply_cheque_instrument_override) and a narration that starts with the UPI "
+        "structure (UPI_START_RE) overwrite the model; other UPI and cheque-return "
+        "rules only fill a blank.",
+    ),
+    "Level_2": ("code", "apply_strict_level2 sets every row; the model value is never used."),
+    "Level_3": (
+        "master",
+        "Code wins for salary, ATM, cheque, cash and PAYTMQR / merchant-only UPI IDs; "
+        "other code rules (counterparty type, MERCHANT marker, known hyphen merchants) "
+        "are listed in the change log as exceptions.",
+    ),
+    "Level_4": (
+        "code",
+        "Platform or gateway first (detect_level_4_platform_or_bank); the bank is used "
+        "only when no platform is present. A bank never replaces a platform.",
+    ),
+    "Level_5": (
+        "master",
+        "Code fills blanks, clears 'p2p transfer' on merchants, and wins for salary, "
+        "ATM, cheque, cash and PAYTMQR.",
+    ),
+    "Level_6": (
+        "master",
+        "Code fills blanks and wins for salary, ATM, cheque, cash, PAYTMQR and BBPS "
+        "biller names; the institution rule only clears a bank echo. Slash UPI: Master "
+        "name for merchant / institution rows, narration payee name for p2p rows.",
+    ),
+    "Level_7": ("code", "apply_level7_recurrence only."),
+}
+
 SALARY_KEYWORDS = re.compile(
     r"\b(?:salary|salaryxce|payroll|payslip|labour|wages|sal)\b",
     flags=re.IGNORECASE,
@@ -32,6 +77,22 @@ SALARY_ENTITY_STOPWORDS = re.compile(
     r"\b(?:salary|salaryxce|payroll|payslip|labour|wages|sal|credit|credited|via|by|from|for)\b",
     flags=re.IGNORECASE,
 )
+# Words and month names removed from a salary row's Level 6 (see clean_salary_entity).
+SALARY_FILLER_WORDS = frozenset(
+    {
+        "salary", "salaryxce", "payroll", "payslip", "labour", "wages", "sal",
+        "for", "of", "the", "month", "credit", "credited", "via", "by", "from", "to",
+    }
+)
+SALARY_MONTH_WORDS = frozenset(
+    {
+        "jan", "january", "feb", "february", "mar", "march", "apr", "april", "may",
+        "jun", "june", "jul", "july", "aug", "august", "sep", "sept", "september",
+        "oct", "october", "nov", "november", "dec", "december",
+    }
+)
+# "sal ary" / "sala ry" are "salary" broken by statement line wrapping.
+SPLIT_SALARY_RE = re.compile(r"\bsal\s+ary\b|\bsala\s+ry\b|\bsalar\s+y\b", flags=re.IGNORECASE)
 MIN_SALARY = 10_000
 MIN_SALARY_MONTHS = 2
 SALARY_DAY_STD_MAX = 7
@@ -69,13 +130,16 @@ MERCHANT_MARKER_RE = re.compile(
     r"(?:^|[/|])\s*MERCHANT\s*(?:[/|]|$)",
     flags=re.IGNORECASE,
 )
+# Whole words only, so "cashfree" or "cashback" never match. WDL / WITHDRAWAL /
+# EAW / NFS are cash only when the narration is not a charge or fee.
 ATM_WITHDRAWAL_RE = re.compile(
-    r"\bATM[\s\-/|]*WDL\b|\bATM\s*[/|]\s*DR\s*(?:[/|]|$)|\bATW(?![A-Za-z])",
+    r"\bATM[\s\-/|]*WDL\b|\bATM\s*[/|]\s*DR\s*(?:[/|]|$)|\bATW(?![A-Za-z])"
+    r"|\b(?:WDL|WITHDRAWAL|EAW|NFS)(?![A-Za-z])(?!.*\b(?:CHG|CHGS|CHARGES?|FEES?)\b)",
     flags=re.IGNORECASE,
 )
 SYSTEM_INITIATED_RE = re.compile(
     r"\b(?:"
-    r"NACH|ACH|ECS|"
+    r"E?NACH|ACH|ECS|"
     r"AUTO[\s-]?DEBIT|AUTODEBIT|"
     r"AUTO[\s-]?PAY|AUTOPAY|"
     r"STANDING\s+INSTRUCTION|"
@@ -204,6 +268,10 @@ MERCHANT_DEFAULT_PURPOSES = {
     "mirae": "financial services",
 }
 HYPHEN_UPI_RE = re.compile(r"^\s*UPI\s*-", flags=re.IGNORECASE)
+# The narration itself starts with the UPI structure ("UPI/..." or "UPI-..."),
+# optionally after the bank's "TO TRANSFER-" / "BY TRANSFER-" prefix. A "UPI" word
+# later in the text does not count.
+UPI_START_RE = re.compile(r"^\s*(?:(?:TO|BY)\s+TRANSFER\s*-\s*)?UPI\s*[/-]", flags=re.IGNORECASE)
 BANK_CODE_TO_NAME = {
     "sbin": "state bank of india",
     "hdfc": "hdfc bank",
@@ -231,22 +299,26 @@ PLATFORM_ALIASES = {
     "bhim": ("bhim", "bharat interface for money"),
     "bharatpe": ("bharatpe", "bharat pe"),
     "mobikwik": ("mobikwik", "mobi kwik"),
-    "cred": ("cred pay", "cred"),
+    "cred": ("cred pay", "credpay", "cred"),
     "whatsapp pay": ("whatsapp pay", "whatsapp payments"),
     "jiofinance": ("jiofinance", "jio finance"),
-    "razorpay": ("razorpay", "razor pay"),
+    # "rz p" / "r zp" / "p ayu" / "pa yu" are gateway codes split by statement line wrapping.
+    "razorpay": ("razorpay", "razor pay", "rzp", "rz p", "r zp"),
+    "getepay": ("getepay", "get epay"),
     "cashfree": ("cashfree", "cash free"),
-    "payu": ("payu", "pay u"),
+    "payu": ("payu", "pay u", "p ayu", "pa yu"),
     "billdesk": ("billdesk", "bill desk"),
     "juspay": ("juspay", "jus pay"),
     "pine labs": ("pine labs", "pinelabs"),
     "payzapp": ("payzapp", "pay zapp"),
     "freecharge": ("freecharge", "free charge"),
     "mobikwik zip": ("mobikwik zip",),
+    "mswipe": ("mswipe", "m swipe"),
 }
 
 EMBEDDED_PLATFORM_ALIASES = {
     "razorpay": "razorpay",
+    "getepay": "getepay",
     "cashfree": "cashfree",
     "billdesk": "billdesk",
     "phonepe": "phonepe",
@@ -255,6 +327,7 @@ EMBEDDED_PLATFORM_ALIASES = {
     "juspay": "juspay",
     "freecharge": "freecharge",
     "payzapp": "payzapp",
+    "mswipe": "mswipe",
     "googlepay": "google pay",
     "amazonpay": "amazon pay",
     "pinelabs": "pine labs",
@@ -314,6 +387,7 @@ BANK_ALIASES = {
     "india post payments bank": ("india post payments bank", "ippb"),
     "fino payments bank": ("fino payments bank", "fino"),
     "airtel payments bank": ("airtel payments bank", "airtel bank"),
+    "dbs bank": ("dbs bank", "dbsbank", "dbs", "dbss"),
 }
 
 
@@ -361,6 +435,18 @@ def detect_level_4_platform_or_bank(text: str) -> str:
         return bank_matches[0][1]
 
     return ""
+
+
+def _is_platform_label(label: str) -> bool:
+    """Return True for a Level 4 label that names a platform or gateway, not a bank.
+
+    Unlike ``is_payment_intermediary_label`` this counts every ``PLATFORM_ALIASES``
+    name (paytm, billdesk, getepay ...), because for Level 4 the platform always
+    wins over the bank.
+    """
+
+    value = _normalize_compare(label)
+    return bool(value) and (value in PLATFORM_ALIASES or is_payment_intermediary_label(value))
 
 
 NARRATION_LEVEL5_PATTERNS: list[tuple[re.Pattern[str], str]] = [
@@ -638,8 +724,10 @@ INFT_ENTITY_RE = re.compile(r"^\s*(?:INF|BIL)/INFT/[^/]*\d[^/]*/(.*)$", flags=re
 MMT_IMPS_ENTITY_RE = re.compile(r"^\s*MMT/IMPS/\d{6,}/[^/]*/([^/]+)", flags=re.IGNORECASE)
 INTERNAL_TRANSFER_ENTITY_RE = re.compile(r"^\s*TRFR\s+(?:TO|FROM)\s*:\s*(.+)$", flags=re.IGNORECASE)
 SLASH_ENTITY_RAIL_RE = re.compile(r"\b(UPI|NEFT|IMPS|RTGS|ATM)/(.*)", flags=re.IGNORECASE)
-# Allow digits inside the biller code (e.g. "BBPS/DR/MCGMWATE1234").
-BBPS_BILLER_RE = re.compile(r"\bBBPS/(?:DR|CR)/([A-Z][A-Z0-9 ]*[A-Z0-9])\d", flags=re.IGNORECASE)
+# The biller code is the name only: digits inside it are kept ("D2HME2025031234"
+# gives "D2HME"), but the date/reference digits that follow it are not
+# ("LIC2025032389" gives "LIC", "MAHANAGAR GAS2025031201" gives "MAHANAGAR GAS").
+BBPS_BILLER_RE = re.compile(r"\bBBPS/(?:DR|CR)/([A-Z](?:[A-Z0-9 ]*[A-Z])?)\s*\d+", flags=re.IGNORECASE)
 BBPS_BILLER_NAMES = {"jiofiber": "jio fiber", "tatasky": "tata sky"}
 # Aliases for well-known BBPS biller codes that appear verbatim in narrations.
 BBPS_BILLER_ALIASES: dict[str, str] = {
@@ -818,6 +906,11 @@ def _apply_transaction_rules(
     if default_p2p_purpose and result["Level_3"] == "p2p" and not result["Level_5"]:
         result["Level_5"] = "p2p transfer"
 
+    # A merchant is never a person-to-person transfer, whichever narration
+    # format (slash or hyphen UPI) or Master Sheet row put the label there.
+    if result["Level_3"] == "merchant" and result["Level_5"] == "p2p transfer":
+        result["Level_5"] = ""
+
     if result["Level_1"] == "cash":
         result["Level_3"] = ""
         if is_payment_intermediary_label(result["Level_4"]):
@@ -825,12 +918,19 @@ def _apply_transaction_rules(
         result["Level_5"] = ""
         result["Level_6"] = ""
 
-    # For an institution row Level 6 usually repeats the bank, so it is cleared,
-    # unless the narration names a different counterparty (e.g. "BLUE APPARELS").
+    # For an institution row Level 6 is cleared only when it just repeats the
+    # bank (or is a generic / category word). A named counterparty (a person, a
+    # company, a known merchant such as "BLUE APPARELS") is kept.
     if (
         result["Level_3"] == "institution"
         and result["Level_4"]
         and not (confirmed_level6 and _normalize_compare(result["Level_6"]) == confirmed_level6)
+        and (
+            _normalize_compare(result["Level_6"]) == _normalize_compare(result["Level_4"])
+            or is_bank_only_part(result["Level_6"])
+            or is_generic_level6(result["Level_6"])
+            or _normalize_compare(result["Level_6"]) == _normalize_compare(result["Level_5"])
+        )
     ):
         result["Level_6"] = ""
 
@@ -966,7 +1066,8 @@ def apply_structured_upi_overrides(
             inherited_purpose = prediction["Level_5"]
 
     result["Level_1"] = "upi"
-    if bank_name:
+    # Platform first: a bank from a later part never replaces a platform.
+    if bank_name and not (_is_platform_label(result["Level_4"]) and not _is_platform_label(bank_name)):
         result["Level_4"] = bank_name
 
     if marker in UPI_P2_MERCHANT_MARKERS:
@@ -981,6 +1082,16 @@ def apply_structured_upi_overrides(
         result["Level_5"] = "p2p transfer"
 
     return _apply_transaction_rules(result)
+
+
+# A payment gateway named as a separate word inside a payee / VPA segment.
+GATEWAY_WORD_RE = re.compile(
+    r"(?<![a-z])(?:rzp|razorpay|payu|cashfree|billdesk|getepay|bharatpe|phonepe|paytm|mobikwik)(?![a-z])"
+)
+
+
+# A gateway name fused to the front of a word ("razorpayzomato").
+GATEWAY_PREFIX_RE = re.compile(r"^(?:razorpay|payu|cashfree|billdesk|getepay|bharatpe|phonepe|paytm|mobikwik|rzp)")
 
 
 def extract_hyphen_upi_merchant(particulars: str) -> str:
@@ -1002,9 +1113,21 @@ def extract_hyphen_upi_merchant(particulars: str) -> str:
         return ""
 
     for candidate in [vpa_segment.split("@", 1)[0], *payee_segments]:
-        letters = re.sub(r"[^a-z]", "", candidate.lower())
+        candidate = candidate.lower()
+        # "<merchant> <gateway> <bank handle>" (e.g. "cleartrip rzp rxairtel"): the
+        # text after a gateway word is the gateway's bank handle, not the merchant,
+        # so a brand found only there (airtel) is not the merchant. When the
+        # gateway comes first ("razorpay zomato") the whole text is searched.
+        gateway = GATEWAY_WORD_RE.search(candidate)
+        if gateway and re.search(r"[a-z]", candidate[: gateway.start()]):
+            candidate = candidate[: gateway.start()]
+        # A brand must start a word, or follow a gateway name fused to it
+        # ("razorpayzomato"). A brand buried inside a bank handle or in letters
+        # joined across words ("rxairtel", "saji okicici" -> "jio") is not the merchant.
+        tokens = re.findall(r"[a-z]+", candidate)
+        tokens += [GATEWAY_PREFIX_RE.sub("", token, count=1) for token in tokens]
         for fragment in sorted(KNOWN_MERCHANT_FRAGMENTS, key=lambda item: (-len(item), item)):
-            if fragment in letters:
+            if any(token.startswith(fragment) for token in tokens):
                 return fragment
     return ""
 
@@ -1067,22 +1190,33 @@ def apply_hyphen_upi_merchant_override(
     level4_candidates = [result["Level_4"]] + [
         prediction.get("Level_4", "") for _, prediction in part_predictions
     ]
-    # Level 4 on a merchant row names the bank, never the payment gateway: take a
-    # bank the model predicted, else the bank named by the narration, else leave
-    # it blank.
-    bank = next(
-        (label for label in level4_candidates if label and not is_payment_intermediary_label(label)),
-        "",
-    )
-    result["Level_4"] = bank or derive_upi_bank(particulars)
+    # Level 4 platform first: the platform or gateway named by the narration or
+    # predicted by the model (razorpay, payu, cred, getepay ...) wins; the bank
+    # (model, then narration IFSC/handle) is used only when no platform exists.
+    detected = detect_level_4_platform_or_bank(particulars)
+    platform = detected if _is_platform_label(detected) else ""
+    platform = platform or next((label for label in level4_candidates if _is_platform_label(label)), "")
+    bank = next((label for label in level4_candidates if label and not _is_platform_label(label)), "")
+    result["Level_4"] = platform or bank or derive_upi_bank(particulars)
 
-    result["Level_1"] = result["Level_1"] or "upi"
+    result["Level_1"] = "upi" if UPI_START_RE.match(str(particulars or "")) else (result["Level_1"] or "upi")
     result["Level_3"] = "merchant"
-    result["Level_6"] = merchant
-    if purpose:
+    # Master first: a fuller Master Sheet name ("swiggy dine in") is kept over the
+    # shorter brand ("swiggy") found in the narration.
+    current_level6 = result.get("Level_6", "")
+    brand_letters = re.sub(r"[^a-z0-9]", "", merchant.lower())
+    current_letters = re.sub(r"[^a-z0-9]", "", current_level6.lower())
+    if not (
+        current_level6
+        and not is_generic_level6(current_level6)
+        and brand_letters
+        and brand_letters in current_letters
+    ):
+        result["Level_6"] = merchant
+    # Master first: a purpose from the Master Sheet is kept. Code fills a blank,
+    # and replaces "p2p transfer" / "salary", which a merchant cannot have.
+    if result["Level_5"] in {"", "p2p transfer", "salary"}:
         result["Level_5"] = purpose
-    elif result["Level_5"] in {"p2p transfer", "salary"}:
-        result["Level_5"] = ""
 
     return _apply_transaction_rules(result)
 
@@ -1131,13 +1265,15 @@ def apply_raw_transaction_overrides(
         bank_code = match.group(2).strip().lower()
         vpa = match.group(3).strip().lower()
         bank_name = BANK_CODE_TO_NAME.get(bank_code, "")
-        is_gateway = any(fragment in vpa for fragment in GATEWAY_VPA_FRAGMENTS)
+        # A bare merchant-QR id (PhonePe business "q<digits>", "paytmqr...", BharatPe)
+        # is a merchant even when the statement cut off the "@handle".
+        is_gateway = any(fragment in vpa for fragment in GATEWAY_VPA_FRAGMENTS) or bool(
+            re.match(r"(?:q\d{6,}|paytmqr|bharatpe)", vpa)
+        )
 
-        result["Level_1"] = result["Level_1"] or "upi"
-        result["Level_4"] = bank_name or result["Level_4"]
-
-        if name != "merchant":
-            result["Level_6"] = name
+        result["Level_1"] = "upi" if UPI_START_RE.match(text) else (result["Level_1"] or "upi")
+        if not _is_platform_label(result["Level_4"]):
+            result["Level_4"] = bank_name or result["Level_4"]
 
         if is_gateway:
             result["Level_3"] = "merchant"
@@ -1174,6 +1310,18 @@ def apply_raw_transaction_overrides(
         if result.get("Level_5") == "p2p transfer":
             result["Level_5"] = ""
 
+    # Slash UPI Level 6: the Master Sheet holds the clean brand name, so for a
+    # merchant or institution row it is kept. A p2p row (or a blank / generic
+    # Level 6) takes the payee name from the narration.
+    if match and name != "merchant":
+        keep_master_name = (
+            result.get("Level_3") in {"merchant", "institution"}
+            and bool(result.get("Level_6"))
+            and not is_generic_level6(result["Level_6"])
+        )
+        if not keep_master_name:
+            result["Level_6"] = name
+
     if SALARY_KEYWORDS.search(text) and not is_debit:
         entity = extract_level6_entity(text)
         if not entity:
@@ -1182,18 +1330,15 @@ def apply_raw_transaction_overrides(
             entity = re.sub(r"\s+", " ", entity).strip().lower()
 
         result["Level_5"] = "salary"
-        result["Level_6"] = entity
+        result["Level_6"] = clean_salary_entity(entity)
 
+    # Level 4 platform first: the narration's platform or gateway (RAZORPAYZOMATO,
+    # "rzp icici") is kept as Level 4, and a bank found in the narration never
+    # replaces a platform already in Level 4.
     detected_level4 = detect_level_4_platform_or_bank(marker_text)
-    # A hyphen-UPI known-merchant row has already had Level 4 resolved to a bank
-    # (or blanked) by apply_hyphen_upi_merchant_override. A gateway name found
-    # inside the narration (e.g. RAZORPAYZOMATO) must not overwrite that.
-    gateway_on_merchant_row = bool(
-        detected_level4
-        and extract_hyphen_upi_merchant(text)
-        and is_payment_intermediary_label(detected_level4)
-    )
-    if detected_level4 and not gateway_on_merchant_row:
+    if detected_level4 and not (
+        _is_platform_label(result["Level_4"]) and not _is_platform_label(detected_level4)
+    ):
         result["Level_4"] = detected_level4
 
     upper_text = text.upper()
@@ -1273,7 +1418,7 @@ GOVERNMENT_PAYEE_RE = re.compile(r"(?:^|/)\s*GOVT\s*(?:/|$)|\bCHALLAN\b", flags=
 #   Mandate debits (NACH / ECS / auto-debit / standing instruction). Mandates are
 #   registered by institutions and companies, never by an individual.
 MANDATE_DEBIT_RE = re.compile(
-    r"\b(?:NACH|ECS|ACH|ACHDR|AUTO[\s-]?DEBIT|AUTODEBIT|AUTO[\s-]?PAY|AUTOPAY|"
+    r"\b(?:E?NACH|ECS|ACH|ACHDR|AUTO[\s-]?DEBIT|AUTODEBIT|AUTO[\s-]?PAY|AUTOPAY|"
     r"STANDING\s+INSTRUCTION|SI[\s-]?(?:DEBIT|MAD)|UPI\s+MANDATE|MANDATE)\b",
     flags=re.IGNORECASE,
 )
@@ -1383,12 +1528,13 @@ CHEQUE_RETURN_RE = re.compile(r"^\s*REJECT:(\d{1,6}):", flags=re.IGNORECASE)
 
 
 def apply_cheque_instrument_override(particulars: str, result: dict[str, str]) -> dict[str, str]:
-    """Fill a blank Level_1 with "cheque" for a full cheque-instrument narration.
+    """Set Level_1 to "cheque" for a full cheque-instrument narration.
 
-    Only a blank Level_1 is filled, so an explicit rail found elsewhere is kept.
+    The full instrument layout (CLG|TRF/<drawer>/<cheque no>/<bank>/<date>) is
+    unambiguous, so it overrides a Level_1 from the Master Sheet.
     """
 
-    if not result.get("Level_1") and CHEQUE_INSTRUMENT_RE.match(str(particulars or "")):
+    if CHEQUE_INSTRUMENT_RE.match(str(particulars or "")):
         result["Level_1"] = "cheque"
     return result
 
@@ -1447,6 +1593,39 @@ def extract_salary_entity(text: str) -> str:
     return value
 
 
+def clean_salary_entity(value: str) -> str:
+    """Return the salary payer name only, for Level 6 of a salary row.
+
+    Removes the salary words, "for / of / the / month", a month name that follows
+    them ("salary for dec"), rail words, reference numbers and x-masks, and a
+    stray one- or two-letter tail left after a salary word ("labour an").
+    "ctqgg a salary for dec" gives "ctqgg a".
+    """
+
+    text = SPLIT_SALARY_RE.sub("salary", str(value or "").lower())
+    kept: list[str] = []
+    prev_filler = False
+    prev_salary_word = False
+    for token in (item for item in re.split(r"[^a-z0-9]+", text) if item):
+        if token in SALARY_FILLER_WORDS:
+            prev_filler = True
+            prev_salary_word = token not in {"for", "of", "the", "month", "credit", "credited", "via", "by", "from", "to"}
+            continue
+        if token in SALARY_MONTH_WORDS and prev_filler:
+            continue
+        if (
+            re.search(r"\d", token)
+            or re.fullmatch(r"x{2,}", token)
+            or token in {"neft", "imps", "upi", "rtgs", "ecs", "nach", "bank", "payment", "transfer"}
+            or (prev_salary_word and len(token) <= 2)
+        ):
+            prev_filler = prev_salary_word = False
+            continue
+        kept.append(token)
+        prev_filler = prev_salary_word = False
+    return " ".join(kept)
+
+
 def derive_first_level_classification(row: pd.Series) -> str:
     """Map row-level predictions into a coarse business transaction label."""
 
@@ -1478,7 +1657,9 @@ def derive_first_level_classification(row: pd.Series) -> str:
         return "Cash Withdrawal"
     if level_1 == "cash" and credit_num > 0:
         return "Cash Deposit"
-    if level_2 == "auto-debit":
+    # Level_2 holds "System generated" / "User-generated", never "auto-debit": a
+    # system-generated row whose narration is a mandate debit is the ECS/NACH row.
+    if level_2 in {"auto-debit", "system generated"} and is_debit and MANDATE_DEBIT_RE.search(particulars):
         return "ECS/NACH Payment"
     if level_5 == "loan repayment":
         return "Loan"
@@ -1595,6 +1776,24 @@ def _company_name_in_narration(text: str) -> bool:
     return bool(BUSINESS_RAIL_RE.search(text) and BUSINESS_WORD_RE.search(text))
 
 
+SALARY_CHEQUE_RAIL_RE = re.compile(r"\b(?:CLG|CLEARING|CHEQUE|CHQ|CHEQ)\b", flags=re.IGNORECASE)
+
+
+def _is_non_salary_counterparty(row: pd.Series) -> bool:
+    """Cheque credits and business counterparties are never inferred salary.
+
+    Only used for rows without a salary word: such rows may not become
+    salary on recurrence and date consistency alone.
+    """
+
+    text = str(row.get("Particulars", "") or "")
+    if str(row.get("Level_1", "") or "").strip().lower() == "cheque" or SALARY_CHEQUE_RAIL_RE.search(text):
+        return True
+    if str(row.get("Level_3", "") or "").strip().lower() in {"merchant", "institution"}:
+        return True
+    return bool(BUSINESS_WORD_RE.search(text))
+
+
 def apply_pre_detect_salary_overrides(df: pd.DataFrame) -> pd.DataFrame:
     """Apply structural overrides to output_df before detect_salary runs.
 
@@ -1683,12 +1882,14 @@ def apply_pre_detect_salary_overrides(df: pd.DataFrame) -> pd.DataFrame:
 def detect_salary(df: pd.DataFrame) -> pd.DataFrame:
     """Flag salary-like credits using explicit text plus recurring credits.
 
-    Over-flagging guard (2024-10-24):
-    - Statistical clusters require EITHER a salary keyword hit on any member
-      OR the same sender recurring across 3 or more distinct calendar months
-      (not just 2 occurrences).
-    - CLG, DRP, TRF, UPI-P2A and business-word narrations are excluded from
-      the statistical cluster even when they pass the amount / day-std tests.
+    - A salary word in the narration on a credit is salary (confidence 1.0).
+    - Otherwise credits >= MIN_SALARY are clustered by rounded amount. A
+      cluster recurs when it spans MIN_SALARY_MONTHS distinct calendar
+      months (+0.4); day-of-month std <= SALARY_DAY_STD_MAX adds +0.3 and a
+      salary word +0.3; accepted at score >= 0.6.
+    - CLG, DRP, TRF, UPI-P2A, cheque, business-word and merchant/institution
+      credits are excluded from inference.
+    - IsSalary, Level_5 = salary and First Level = Salary always agree.
     """
 
     output_df = df.copy()
@@ -1703,63 +1904,46 @@ def detect_salary(df: pd.DataFrame) -> pd.DataFrame:
     )
     debit_mask = (debit_num > 0) & (credit_num <= 0)
 
-    stale_level_5 = (
+    # Salary text is read from the narration only. First/Second Level are
+    # derived from the model's Level_5, so searching them would let a
+    # predicted "salary" label count as its own evidence.
+    salary_text = output_df["Particulars"].astype(str).str.contains(SALARY_KEYWORDS, na=False)
+    credit_only = (credit_num > 0) & ~debit_mask
+
+    # Explicit evidence on a credit: a salary word in the narration, or a
+    # Level_5 = salary predicted by the keyword model (codebook employers).
+    predicted_salary = (
         output_df["Level_5"].astype(str).str.strip().str.lower().eq("salary")
         if "Level_5" in output_df.columns
         else pd.Series(False, index=output_df.index)
     )
-    stale_first_level = (
-        output_df["First Level Classification"].astype(str).str.strip().str.lower().eq("salary")
-    )
-    stale_mask = debit_mask & (stale_level_5 | stale_first_level)
-    if stale_mask.any():
-        if "Level_5" in output_df.columns:
-            output_df.loc[stale_mask & stale_level_5, "Level_5"] = ""
-        stale_rows = output_df.loc[stale_mask]
-        output_df.loc[stale_mask, "First Level Classification"] = stale_rows.apply(
-            derive_first_level_classification, axis=1
-        )
-        output_df.loc[stale_mask, "Second Level Classification"] = stale_rows.apply(
-            derive_second_level_classification, axis=1
-        )
-
-    output_df["NormText"] = (
-        output_df["Particulars"].astype(str)
-        + " "
-        + output_df["First Level Classification"].astype(str)
-        + " "
-        + output_df["Second Level Classification"].astype(str)
-    ).str.lower()
-
-    explicit_mask = (
-        output_df.get("Level_5", pd.Series("", index=output_df.index))
-        .astype(str)
-        .str.contains("salary", case=False, na=False)
-        | output_df.get("First Level Classification", pd.Series("", index=output_df.index))
-        .astype(str)
-        .str.contains("salary", case=False, na=False)
-        | (output_df["NormText"].str.contains(SALARY_KEYWORDS, na=False) & (credit_num >= MIN_SALARY))
-    ) & ~debit_mask
-
+    explicit_mask = (salary_text | predicted_salary) & credit_only
     output_df.loc[explicit_mask, "IsSalary"] = 1
     output_df.loc[explicit_mask, "SalaryConfidence"] = 1.0
 
     # Without a Date column no row has a usable date, so recurring-credit
     # inference is skipped; explicit salary evidence above still applies.
+    # Statement dates are day-first text ("2/3/25" is 2 March) mixed with
+    # real dates, so they are parsed the same way as Level 7 does.
     date_column = (
         output_df["Date"]
         if "Date" in output_df.columns
         else pd.Series(pd.NaT, index=output_df.index)
     )
-    dates = pd.to_datetime(date_column, errors="coerce")
+    dates = pd.to_datetime(date_column.map(_level7_parse_date), errors="coerce")
     candidates = output_df.index[
-        (~explicit_mask) & (~debit_mask) & (credit_num >= MIN_SALARY) & dates.notna()
+        (~explicit_mask) & credit_only & (credit_num >= MIN_SALARY) & dates.notna()
     ]
 
     if len(candidates) >= 2:
-        # Exclude narration patterns that should never be salary.
-        exclusion_mask = output_df.loc[candidates, "Particulars"].astype(str).apply(
-            lambda t: bool(_SALARY_EXCLUSION_RE.search(t)) or _company_name_in_narration(t)
+        # Exclude narration patterns that should never be salary, plus cheque
+        # credits and business counterparties: without a salary word they
+        # must not pass on recurrence and date consistency alone.
+        exclusion_mask = output_df.loc[candidates].apply(
+            lambda row: bool(_SALARY_EXCLUSION_RE.search(str(row["Particulars"])))
+            or _company_name_in_narration(str(row["Particulars"]))
+            or _is_non_salary_counterparty(row),
+            axis=1,
         )
         candidates = candidates[~exclusion_mask.values]
 
@@ -1770,19 +1954,15 @@ def detect_salary(df: pd.DataFrame) -> pd.DataFrame:
             clusters[int(amount_key)].append(index)
 
         for indices in clusters.values():
-            if len(indices) < MIN_SALARY_MONTHS:
+            # "Recurs" means the same rounded amount in at least
+            # MIN_SALARY_MONTHS distinct calendar months (year + month);
+            # two credits in one month count as one month.
+            distinct_months = dates.loc[indices].dt.to_period("M").nunique()
+            if distinct_months < MIN_SALARY_MONTHS:
                 continue
 
             day_std = dates.loc[indices].dt.day.std(ddof=0)
-            text_hit = output_df.loc[indices, "NormText"].str.contains(SALARY_KEYWORDS, na=False).any()
-
-            # Tighter gate: require a salary-keyword hit OR the same sender
-            # across at least 3 distinct calendar months.
-            distinct_months = dates.loc[indices].dt.to_period("M").nunique()
-            qualifies_by_months = distinct_months >= 3
-
-            if not text_hit and not qualifies_by_months:
-                continue
+            text_hit = bool(salary_text.loc[indices].any())
 
             score = 0.40
             score += 0.30 if (pd.notna(day_std) and day_std <= SALARY_DAY_STD_MAX) else 0.0
@@ -1795,9 +1975,32 @@ def detect_salary(df: pd.DataFrame) -> pd.DataFrame:
     output_df.loc[debit_mask, "IsSalary"] = 0
     output_df.loc[debit_mask, "SalaryConfidence"] = 0.0
 
+    # Rows that are not salary must not keep a salary label from the model or
+    # from an earlier step: clear Level_5 and re-derive First/Second Level.
+    not_salary = output_df["IsSalary"].ne(1)
+    stale_level_5 = (
+        output_df["Level_5"].astype(str).str.strip().str.lower().eq("salary")
+        if "Level_5" in output_df.columns
+        else pd.Series(False, index=output_df.index)
+    )
+    stale_first_level = (
+        output_df["First Level Classification"].astype(str).str.strip().str.lower().eq("salary")
+    )
+    stale_mask = not_salary & (stale_level_5 | stale_first_level)
+    if stale_mask.any():
+        if "Level_5" in output_df.columns:
+            output_df.loc[stale_mask & stale_level_5, "Level_5"] = ""
+        stale_rows = output_df.loc[stale_mask]
+        output_df.loc[stale_mask, "First Level Classification"] = stale_rows.apply(
+            derive_first_level_classification, axis=1
+        )
+        output_df.loc[stale_mask, "Second Level Classification"] = stale_rows.apply(
+            derive_second_level_classification, axis=1
+        )
+
     salary_mask = output_df["IsSalary"].eq(1)
     salary_entity = output_df["Particulars"].astype(str).map(
-        lambda text: extract_level6_entity(text) or extract_salary_entity(text)
+        lambda text: clean_salary_entity(extract_level6_entity(text) or text)
     )
     output_df.loc[salary_mask, "Level_0"] = "credit"
     # Level_1 is the payment rail (rtgs/neft/imps/cheque...); salary is a
@@ -1809,7 +2012,7 @@ def detect_salary(df: pd.DataFrame) -> pd.DataFrame:
     output_df.loc[salary_mask, "First Level Classification"] = "Salary"
     output_df.loc[salary_mask, "Second Level Classification"] = ""
 
-    return output_df.drop(columns=["NormText"])
+    return output_df
 
 
 def build_salary_summary(df: pd.DataFrame) -> pd.DataFrame:
@@ -1819,7 +2022,11 @@ def build_salary_summary(df: pd.DataFrame) -> pd.DataFrame:
     if salary_df.empty:
         return salary_df
 
-    salary_df["Month"] = pd.to_datetime(salary_df["Date"], errors="coerce").dt.to_period("M").astype(str)
+    salary_df["Month"] = (
+        pd.to_datetime(salary_df["Date"].map(_level7_parse_date), errors="coerce")
+        .dt.to_period("M")
+        .astype(str)
+    )
     summary_columns = [
         "Date",
         "Month",
@@ -1895,7 +2102,7 @@ LEVEL7_NOT_INSTRUMENT_RE = re.compile(
 )
 # Standing-instruction style evidence that is reliable even on manual transfer rails.
 LEVEL7_MANDATE_RE = re.compile(
-    r"\b(?:NACH|ACH|ECS|AUTO[\s-]?DEBIT|AUTODEBIT|AUTO[\s-]?PAY|AUTOPAY|"
+    r"\b(?:E?NACH|ACH|ECS|AUTO[\s-]?DEBIT|AUTODEBIT|AUTO[\s-]?PAY|AUTOPAY|"
     r"STANDING\s+INSTRUCTION|RECURRING\s+PAYMENT|UPI\s+MANDATE|SI[\s-]?DEBIT|MANDATE)\b",
     flags=re.IGNORECASE,
 )

@@ -103,7 +103,15 @@ EMI_RE = re.compile(
     re.IGNORECASE,
 )
 SAVING_RE = re.compile(
-    r"\b(fd|fixed deposit|rd|recurring deposit|ppf|nps|mutual fund|sip)\b",
+    # FD only as a whole word, and not the first half of a wrapped Federal
+    # Bank IFSC ("@FEDERAL-FD RL0001520" is FDRL0001520, not a deposit).
+    r"\b(fd(?!\s*rl\d)|fixed deposit|rd|recurring deposit|ppf|nps|mutual fund|sip)\b",
+    re.IGNORECASE,
+)
+# Mutual-fund houses and investment payments: ICICIMF, SBIMF, "MF SIP", and
+# narrations whose last segment is the "Inv" purpose tag (".../MERCHANT/Inv-").
+INVESTMENT_TEXT_RE = re.compile(
+    r"\b[a-z]{2,12}mf\b|\bmf\s*sip\b|/\s*inv(?:est(?:ment)?s?)?\s*-?\s*$",
     re.IGNORECASE,
 )
 INSURANCE_RE = re.compile(
@@ -304,6 +312,7 @@ class Microsegmenter:
                 and (
                     _flag_segment(row, "investment", self.regexes) == 1
                     or _label(row, "First Level Classification") == "investment"
+                    or INVESTMENT_TEXT_RE.search(_particulars(row)) is not None
                 )
             ),
             axis=1,

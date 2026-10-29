@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import argparse
 import logging
+import shutil
 import sys
+import tempfile
 from pathlib import Path
 from typing import Any
 
@@ -82,7 +84,15 @@ class KeywordClassifier:
                 "Run `python src/train.py --data MASTER_SHEET.csv --output models/` first."
             )
 
-        self.artifacts: PromptArtifacts = joblib.load(bundle_path)
+        # Copy to local /tmp first to avoid macOS iCloud Drive seek/peek
+        # timeouts (Errno 60) when joblib unpickles large models.
+        with tempfile.NamedTemporaryFile(suffix=".joblib", delete=False, dir=tempfile.gettempdir()) as tmp:
+            tmp_path = Path(tmp.name)
+        try:
+            shutil.copyfile(bundle_path, tmp_path)
+            self.artifacts: PromptArtifacts = joblib.load(tmp_path)
+        finally:
+            tmp_path.unlink(missing_ok=True)
         if not hasattr(self.artifacts, "level5_keyword_cues"):
             self.artifacts.level5_keyword_cues = {}
         self.rule_engine = RuleEngine()

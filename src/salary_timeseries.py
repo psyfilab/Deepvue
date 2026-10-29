@@ -6,14 +6,17 @@ import logging
 import re
 from pathlib import Path
 
+# pyrefly: ignore[missing-import]
 import matplotlib
+# pyrefly: ignore[missing-import]
 import matplotlib.dates as mdates
 import pandas as pd
 
-from .statement_classifier import parse_amount
+from .statement_classifier import _level7_parse_date, parse_amount
 
 matplotlib.use("Agg")
 
+# pyrefly: ignore[missing-import]
 import matplotlib.pyplot as plt
 
 logger = logging.getLogger(__name__)
@@ -41,17 +44,13 @@ def _empty_outputs() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
 
 
 def _parse_dates(series: pd.Series) -> pd.Series:
-    """Parse mixed date formats without breaking ISO dates."""
+    """Parse mixed date formats without breaking ISO dates.
 
-    parsed = pd.to_datetime(series, errors="coerce")
-    missing_mask = parsed.isna()
-    if missing_mask.any():
-        parsed.loc[missing_mask] = pd.to_datetime(
-            series.loc[missing_mask],
-            errors="coerce",
-            dayfirst=True,
-        )
-    return parsed
+    Text dates are read day-first ("2/3/25" is 2 March 2025), the same way
+    statement_classifier parses them; real dates and ISO strings are kept.
+    """
+
+    return pd.to_datetime(series.map(_level7_parse_date), errors="coerce")
 
 
 def _has_any_flag(row: pd.Series, flag_columns: tuple[str, ...]) -> int:
@@ -63,16 +62,134 @@ def _has_any_flag(row: pd.Series, flag_columns: tuple[str, ...]) -> int:
     return 0
 
 
-def _is_savings(row: pd.Series) -> int:
-    """Return 1 when a debit is categorized as saving or investment."""
+SAVINGS_TEXT_RE = re.compile(
+    # "FD RL0001520" is a wrapped Federal Bank IFSC (FDRL...), not a deposit.
+    r"\b(?:FD(?!\s*RL\d)|FIXED\s*DEPOSIT|RD|RECURRING\s*DEPOSIT|SIP|MUTUAL\s*FUNDS?|PPF|NPS|INVESTMENTS?)\b",
+    flags=re.IGNORECASE,
+)
+RECHARGE_TEXT_RE = re.compile(r"\b(?:RECHARGE|DTH)\b", flags=re.IGNORECASE)
+CAB_TEXT_RE = re.compile(r"\b(?:CAB|CABS|OLA|UBER|MERU|RAPIDO)\b", flags=re.IGNORECASE)
+CARD_FEE_TEXT_RE = re.compile(r"\bCARD\s+(?:CHARGES?|FEES?)\b", flags=re.IGNORECASE)
+BILL_TEXT_RE = re.compile(r"\b(?:BBPS|BILL\s*PAYMENT|BILLPAY)\b", flags=re.IGNORECASE)
+# Checked on the narration with spaces and punctuation removed, because
+# statements wrap these handles ("GPAY-UTILITY@OK", "GOOGLEBBPSUTILI TY@ICICI").
+BILL_HANDLE_COMPACT = ("GPAYUTILITY", "GOOGLEBBPS")
+# Failed or rejected rows are never savings, expenditure or transfer.
+FAILED_TEXT_RE = re.compile(
+    r"\b(?:REJECT\w*|PAYMENT\s+STOPPED|RETURN\w*|REVERS\w*)\b|REJECT:",
+    flags=re.IGNORECASE,
+)
+EXTRA_EXPENDITURE_FLAG_COLUMNS = (
+    "exp_utility",
+    "exp_transport",
+    "exp_grocery",
+    "exp_pharmacy",
+    "exp_insurance",
+)
+EXTRA_EXPENDITURE_LEVEL5 = frozenset(
+    {
+        "utilities",
+        "mobile recharge",
+        "transport",
+        "grocery",
+        "pharmacy",
+        "health",
+        "healthcare",
+        "insurance",
+        "subscription",
+        "dining",
+        "food",
+    }
+)
+TRANSFER_LEVEL5 = frozenset({"p2p transfer"})
 
-    return _has_any_flag(row, SAVINGS_FLAG_COLUMNS)
+
+def _text(row: pd.Series, column_name: str) -> str:
+    """Return a cell as stripped text ('' for NaN)."""
+
+    value = row.get(column_name, "")
+    return "" if value is None or (not isinstance(value, str) and pd.isna(value)) else str(value).strip()
+
+
+def _is_failed(row: pd.Series) -> bool:
+    """Return True for failed, rejected, returned or reversed rows."""
+
+    return bool(FAILED_TEXT_RE.search(_text(row, "Particulars")))
+
+
+def _savings_match(row: pd.Series) -> bool:
+    """Saving/investment flag, or a savings product named in the narration."""
+
+    if _has_any_flag(row, SAVINGS_FLAG_COLUMNS):
+        return True
+    return bool(SAVINGS_TEXT_RE.search(_text(row, "Particulars")))
+
+
+def _expenditure_match(row: pd.Series) -> bool:
+    """Spending on merchants, bills, utilities, recharge, transport, food,
+    grocery, health, insurance, subscriptions and card fees."""
+
+    if _has_any_flag(row, EXPENDITURE_FLAG_COLUMNS + EXTRA_EXPENDITURE_FLAG_COLUMNS):
+        return True
+    if _text(row, "Level_3").lower() == "merchant":
+        return True
+    if _text(row, "Level_5").lower() in EXTRA_EXPENDITURE_LEVEL5:
+        return True
+    if _text(row, "Level_1").lower() == "bbps":
+        return True
+    particulars = _text(row, "Particulars")
+    compact = re.sub(r"[^A-Z0-9]", "", particulars.upper())
+    if any(handle in compact for handle in BILL_HANDLE_COMPACT):
+        return True
+    return any(
+        pattern.search(particulars)
+        for pattern in (RECHARGE_TEXT_RE, CAB_TEXT_RE, CARD_FEE_TEXT_RE, BILL_TEXT_RE)
+    )
+
+
+def _transfer_match(row: pd.Series) -> bool:
+    """A p2p transfer to a person (UPI, NEFT, RTGS or IMPS)."""
+
+    return (
+        _text(row, "Level_3").lower() == "p2p"
+        or _text(row, "Level_5").lower() in TRANSFER_LEVEL5
+    )
+
+
+def _window_tag(row: pd.Series) -> str:
+    """Return 'savings', 'expenditure', 'transfer' or '' for one row.
+
+    The tags never overlap: Savings, then Expenditure, then Transfer.
+    Failed or rejected rows get no tag.
+    """
+
+    if _is_failed(row):
+        return ""
+    if _savings_match(row):
+        return "savings"
+    if _expenditure_match(row):
+        return "expenditure"
+    if _transfer_match(row):
+        return "transfer"
+    return ""
+
+
+def _is_savings(row: pd.Series) -> int:
+    """Return 1 when a debit is a saving or investment."""
+
+    return int(_window_tag(row) == "savings")
 
 
 def _is_expenditure(row: pd.Series) -> int:
-    """Return 1 when a debit falls inside the requested expenditure basket."""
+    """Return 1 when a debit is spending (never savings)."""
 
-    return _has_any_flag(row, EXPENDITURE_FLAG_COLUMNS)
+    return int(_window_tag(row) == "expenditure")
+
+
+def _is_transfer(row: pd.Series) -> int:
+    """Return 1 when a debit is a p2p transfer (never savings or spending)."""
+
+    return int(_window_tag(row) == "transfer")
 
 
 def _build_daily_curve(
@@ -143,8 +260,10 @@ def _analyze_one_group(
     working_df["_date"] = _parse_dates(working_df["Date"])
     working_df["debit_num"] = working_df["Debit"].apply(parse_amount)
     working_df["credit_num"] = working_df["Credit"].apply(parse_amount)
-    working_df["Is_Savings"] = working_df.apply(_is_savings, axis=1)
-    working_df["Is_Expenditure"] = working_df.apply(_is_expenditure, axis=1)
+    window_tags = working_df.apply(_window_tag, axis=1)
+    working_df["Is_Savings"] = window_tags.eq("savings").astype(int)
+    working_df["Is_Expenditure"] = window_tags.eq("expenditure").astype(int)
+    working_df["Is_Transfer"] = window_tags.eq("transfer").astype(int)
 
     is_salary_series = working_df.get("IsSalary", pd.Series(0, index=working_df.index))
     salary_df = working_df[
@@ -193,9 +312,13 @@ def _analyze_one_group(
         window_df["Expenditure_Debit"] = (
             window_df["debit_num"] * window_df["Is_Expenditure"].astype(int)
         )
+        window_df["Transfer_Debit"] = (
+            window_df["debit_num"] * window_df["Is_Transfer"].astype(int)
+        )
 
         savings_amount = float(window_df["Savings_Debit"].sum())
         expenditure_amount = float(window_df["Expenditure_Debit"].sum())
+        transfer_amount = float(window_df["Transfer_Debit"].sum())
 
         event_row = {
             **group_values,
@@ -206,8 +329,11 @@ def _analyze_one_group(
             "Salary_Amount": float(salary_row["credit_num"]),
             "Savings_Transactions": int(window_df["Is_Savings"].sum()),
             "Expenditure_Transactions": int(window_df["Is_Expenditure"].sum()),
+            "Transfer_Transactions": int(window_df["Is_Transfer"].sum()),
             "Savings_Amount": round(savings_amount, 2),
             "Expenditure_Amount": round(expenditure_amount, 2),
+            "Transfer_Amount": round(transfer_amount, 2),
+            # Savings vs spending only; transfers are not in the ratio.
             "Savings_to_Expenditure_Ratio": round(savings_amount / expenditure_amount, 4)
             if expenditure_amount
             else 0.0,
@@ -236,8 +362,10 @@ def _analyze_one_group(
         "Salary_Amount",
         "Is_Savings",
         "Is_Expenditure",
+        "Is_Transfer",
         "Savings_Debit",
         "Expenditure_Debit",
+        "Transfer_Debit",
     ]
     existing_prefixed = [column for column in ordered_columns if column in window_transactions_df.columns]
     remaining_columns = [
