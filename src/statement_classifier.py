@@ -350,14 +350,16 @@ UPI_APP_HANDLE_RE = re.compile(
 
 BANK_ALIASES = {
     "state bank of india": ("state bank of india", "sbi", "sbin"),
-    "hdfc bank": ("hdfc bank", "hdfc"),
-    "icici bank": ("icici bank", "icici"),
-    "axis bank": ("axis bank", "axis", "utib"),
+    "hdfc bank": ("hdfc bank", "hdfc", "hdf"),
+    "icici bank": ("icici bank", "icici", "icic", "ici"),
+    "axis bank": ("axis bank", "axis", "utib", "axi"),
     "kotak mahindra bank": ("kotak mahindra bank", "kotak bank", "kotak", "kkbk"),
     "punjab national bank": ("punjab national bank", "pnb", "punb"),
     "bank of baroda": ("bank of baroda", "bob", "barb"),
     "bank of india": ("bank of india", "boi"),
-    "canara bank": ("canara bank", "canara", "cnrb"),
+    # "cab" is the cheque-clearing code ("CLG/.../CAB/<date>"). A taxi narration
+    # ("MERU CAB") also carries a longer bank code, which wins on alias length.
+    "canara bank": ("canara bank", "canara", "cnrb", "cab"),
     "union bank of india": ("union bank of india", "union bank", "ubin"),
     "indian bank": ("indian bank", "idib"),
     "indian overseas bank": ("indian overseas bank", "iob", "ioba"),
@@ -366,19 +368,19 @@ BANK_ALIASES = {
     "bank of maharashtra": ("bank of maharashtra", "mahabank", "mahb"),
     "punjab and sind bank": ("punjab and sind bank", "psb", "psib"),
     "yes bank": ("yes bank", "yesb"),
-    "idfc first bank": ("idfc first bank", "idfc bank", "idfc", "idfb"),
-    "indusind bank": ("indusind bank", "indusind", "inbk"),
+    "idfc first bank": ("idfc first bank", "idfc bank", "idfc", "idfb", "idf"),
+    "indusind bank": ("indusind bank", "indusind", "inbk", "indb"),
     "federal bank": ("federal bank", "federal", "fdr", "fdrl"),
     "bandhan bank": ("bandhan bank", "bandhan", "bdbl"),
     "rbl bank": ("rbl bank", "rbl", "ratn"),
     "south indian bank": ("south indian bank", "sib", "sibl"),
-    "karnataka bank": ("karnataka bank", "ktkb"),
-    "city union bank": ("city union bank", "ciub"),
+    "karnataka bank": ("karnataka bank", "ktkb", "karb"),
+    "city union bank": ("city union bank", "ciub", "kcu"),
     "karur vysya bank": ("karur vysya bank", "kvb", "kvbl"),
     "dcb bank": ("dcb bank", "dcb"),
     "tamilnad mercantile bank": ("tamilnad mercantile bank", "tmb", "tmbl"),
     "au small finance bank": ("au small finance bank", "au bank", "aubl"),
-    "idbi bank": ("idbi bank", "idbi", "ibkl"),
+    "idbi bank": ("idbi bank", "idbi", "ibkl", "idb"),
     "cosmos co-operative bank": ("cosmos co-operative bank", "cosmos bank", "cosb"),
     "equitas small finance bank": ("equitas small finance bank", "equitas", "esfb"),
     "ujjivan small finance bank": ("ujjivan small finance bank", "ujjivan", "usfb"),
@@ -386,8 +388,11 @@ BANK_ALIASES = {
     "paytm payments bank": ("paytm payments bank", "paytm bank"),
     "india post payments bank": ("india post payments bank", "ippb"),
     "fino payments bank": ("fino payments bank", "fino"),
-    "airtel payments bank": ("airtel payments bank", "airtel bank"),
+    "airtel payments bank": ("airtel payments bank", "airtel bank", "airp"),
     "dbs bank": ("dbs bank", "dbsbank", "dbs", "dbss"),
+    "maharashtra gramin bank": ("maharashtra gramin bank", "mahg"),
+    "esaf small finance bank": ("esaf small finance bank", "esaf", "esmf", "esb"),
+    "unity small finance bank": ("unity small finance bank",),
 }
 
 
@@ -396,6 +401,47 @@ def _contains_alias(text: str, alias: str) -> bool:
     escaped = re.escape(alias.strip())
     escaped = escaped.replace(r"\ ", r"\s+")
     return bool(re.search(rf"(?<![A-Za-z0-9]){escaped}(?![A-Za-z0-9])", text))
+
+
+def match_bank_name(segment: str) -> str:
+    """Return the full bank name a narration segment spells out, or "".
+
+    Two rules, both against the full bank names (keys of ``BANK_ALIASES``):
+
+    - Fused: the letters of the segment (spaces and punctuation dropped, a
+      trailing "ltd" / "limited" removed) equal a full bank name written
+      without spaces, and there are 8 letters or more
+      ("STATEBANKOFINDIA", "AirtelPaymentsBank", "KARURVYSYABANKLTD").
+    - Truncated: a segment of at least 2 words and 6 letters that is a prefix
+      of exactly one full bank name ("BANK OF B", "STATE BAN", "PUNJAB NA").
+      A prefix shared by several banks ("BANK OF") gives nothing.
+
+    A segment containing a digit is a reference number, never a bank name.
+    """
+
+    text = str(segment or "").strip().lower()
+    if not text or re.search(r"\d", text):
+        return ""
+    words = re.findall(r"[a-z]+", text)
+    if not words:
+        return ""
+
+    letters = "".join(words)
+    for suffix in ("limited", "ltd"):
+        if letters.endswith(suffix) and len(letters) > len(suffix):
+            letters = letters[: -len(suffix)]
+            break
+    if len(letters) >= 8:
+        for name in BANK_ALIASES:
+            if letters == re.sub(r"[^a-z]", "", name):
+                return name
+
+    spaced = " ".join(words)
+    if len(words) >= 2 and len("".join(words)) >= 6:
+        hits = [name for name in BANK_ALIASES if " ".join(re.findall(r"[a-z]+", name)).startswith(spaced)]
+        if len(hits) == 1:
+            return hits[0]
+    return ""
 
 
 def detect_level_4_platform_or_bank(text: str) -> str:
@@ -433,6 +479,13 @@ def detect_level_4_platform_or_bank(text: str) -> str:
     if bank_matches:
         bank_matches.sort(reverse=True)
         return bank_matches[0][1]
+
+    # Last resort, after no platform and no bank alias matched: a bank name that
+    # is fused ("AirtelPaymentsBank") or cut short ("BANK OF B") in one segment.
+    for segment in re.split(r"[/|\-:]", str(text or "")):
+        bank = match_bank_name(segment)
+        if bank:
+            return bank
 
     return ""
 
@@ -707,6 +760,8 @@ GENERIC_LEVEL6_WORDS = frozenset(
         "inf", "inft", "bil", "ift", "inb", "mmt", "clg", "trfr", "cms", "gib",
         "onl", "impstxn", "emi", "loan", "return", "returned", "rtn", "chg",
         "charges", "gst",
+        # Card purchase prefix "ECOM PUR/<merchant>/...".
+        "ecom", "pur",
     }
 )
 # Counterparty position in common bank narration layouts (used for Level 6).
@@ -723,6 +778,8 @@ CHEQUE_ENTITY_RE = re.compile(r"^\s*(?:CLG|TRF)/([^/]+)/", flags=re.IGNORECASE)
 INFT_ENTITY_RE = re.compile(r"^\s*(?:INF|BIL)/INFT/[^/]*\d[^/]*/(.*)$", flags=re.IGNORECASE)
 MMT_IMPS_ENTITY_RE = re.compile(r"^\s*MMT/IMPS/\d{6,}/[^/]*/([^/]+)", flags=re.IGNORECASE)
 INTERNAL_TRANSFER_ENTITY_RE = re.compile(r"^\s*TRFR\s+(?:TO|FROM)\s*:\s*(.+)$", flags=re.IGNORECASE)
+#   ECOM PUR/<MERCHANT>/<pincode>/...   card purchases (merchant name is first)
+ECOM_PUR_ENTITY_RE = re.compile(r"^\s*ECOM\s+PUR/([^/]+)/", flags=re.IGNORECASE)
 SLASH_ENTITY_RAIL_RE = re.compile(r"\b(UPI|NEFT|IMPS|RTGS|ATM)/(.*)", flags=re.IGNORECASE)
 # The biller code is the name only: digits inside it are kept ("D2HME2025031234"
 # gives "D2HME"), but the date/reference digits that follow it are not
@@ -816,7 +873,13 @@ def extract_level6_entity(particulars: str) -> str:
         return entity
 
     text = str(particulars or "")
-    for pattern in (HYPHEN_RAIL_ENTITY_RE, CHEQUE_ENTITY_RE, MMT_IMPS_ENTITY_RE, INTERNAL_TRANSFER_ENTITY_RE):
+    for pattern in (
+        HYPHEN_RAIL_ENTITY_RE,
+        CHEQUE_ENTITY_RE,
+        MMT_IMPS_ENTITY_RE,
+        INTERNAL_TRANSFER_ENTITY_RE,
+        ECOM_PUR_ENTITY_RE,
+    ):
         match = pattern.match(text)
         if match:
             return _clean_layout_name(match.group(1))
@@ -965,6 +1028,8 @@ def is_bank_only_part(part_text: str) -> bool:
     compact = re.sub(r"[^a-z0-9]", "", str(part_text or "").lower())
     if not compact:
         return False
+    if match_bank_name(part_text):
+        return True
     if compact[:4] in BANK_IFSC_CODES and re.fullmatch(r"[a-z]{4}(?:[a-z]?\d{6,}|[a-z]?|0[a-z0-9]{6})", compact):
         return True
     detected = detect_level_4_platform_or_bank(part_text)
@@ -980,41 +1045,26 @@ def aggregate_part_predictions(
     """Combine part-level predictions into one row-level result."""
 
     result = _empty_levels()
-    for _, prediction in part_predictions:
+    # A part that only names a bank (the UTR prefix "HDFCN", a full IFSC,
+    # "AirtelPaymentsBank", "BANK OF B") says which bank moved the money, not who
+    # the counterparty is or what the money was for. It may contribute Level 4
+    # only; its Level 3, 5 and 6 are ignored.
+    bank_only_flags = [is_bank_only_part(part_text) for part_text, _ in part_predictions]
+    for (_, prediction), bank_only in zip(part_predictions, bank_only_flags):
         for level_index in range(8):
             level_name = f"Level_{level_index}"
+            if bank_only and level_name != "Level_4":
+                continue
             if not result[level_name] and prediction.get(level_name):
                 result[level_name] = prediction[level_name]
-
-    # Level 3: a part that only names a bank (e.g. the UTR prefix "HDFCN") says
-    # which bank moved the money, not who the counterparty is. If it supplied
-    # "institution", use the counterparty type from a later part that names an
-    # actual payer/payee (e.g. "BLUE APPARELS" -> merchant), when one exists.
-    first_level3 = next(
-        ((part_text, prediction) for part_text, prediction in part_predictions if prediction.get("Level_3")),
-        None,
-    )
-    if (
-        first_level3
-        and first_level3[1]["Level_3"] == "institution"
-        and is_bank_only_part(first_level3[0])
-    ):
-        counterparty_level3 = next(
-            (
-                prediction["Level_3"]
-                for part_text, prediction in part_predictions
-                if prediction.get("Level_3") and not is_bank_only_part(part_text)
-            ),
-            "",
-        )
-        if counterparty_level3:
-            result["Level_3"] = counterparty_level3
 
     specific_level6 = next(
         (
             prediction["Level_6"]
-            for _, prediction in part_predictions
-            if prediction.get("Level_6") and not is_generic_level6(prediction["Level_6"])
+            for (_, prediction), bank_only in zip(part_predictions, bank_only_flags)
+            if not bank_only
+            and prediction.get("Level_6")
+            and not is_generic_level6(prediction["Level_6"])
         ),
         "",
     )
@@ -1432,6 +1482,9 @@ INSTITUTIONAL_PURPOSE_RE = re.compile(
 INSTITUTIONAL_LEVEL5 = frozenset(
     {"loan repayment", "credit card", "insurance", "financial services", "investment", "tax", "dividend"}
 )
+# Card payments ("ECOM PUR/...", "POS 4160...", "ME DC SI ...") are always paid
+# to a merchant, never to a person.
+CARD_PURCHASE_RE = re.compile(r"^\s*(?:ECOM\s+PUR|POS|ME\s+DC\s+SI)\b", flags=re.IGNORECASE)
 
 
 def apply_counterparty_type_override(
@@ -1449,6 +1502,7 @@ def apply_counterparty_type_override(
       purpose is institutional (loan, EMI, SIP, insurance, card, tax), otherwise
       blank: a mandate is never person-to-person, but the type is not stated.
     - ACH/NACH credit -> institution (a company's dividend/interest payout).
+    - card purchase (ECOM PUR / POS / ME DC SI) -> merchant.
     A merchant or institution label already on the row is never changed. When
     Level 3 stops being p2p, a "p2p transfer" purpose is removed.
     """
@@ -1463,7 +1517,9 @@ def apply_counterparty_type_override(
     is_debit = direction == "debit"
 
     new_level_3 = None
-    if BANK_CHARGE_RE.match(text) or GOVERNMENT_PAYEE_RE.search(text):
+    if CARD_PURCHASE_RE.match(text):
+        new_level_3 = "merchant"
+    elif BANK_CHARGE_RE.match(text) or GOVERNMENT_PAYEE_RE.search(text):
         new_level_3 = "institution"
     elif direction == "credit" and BULK_CORPORATE_CREDIT_RE.search(text):
         new_level_3 = "institution"
@@ -1776,6 +1832,90 @@ def _company_name_in_narration(text: str) -> bool:
     return bool(BUSINESS_RAIL_RE.search(text) and BUSINESS_WORD_RE.search(text))
 
 
+# Level 5 purposes that only a business can sell. A person-to-person row that
+# carries one of these is a contradiction (see apply_counterparty_purpose_compat).
+MERCHANT_LEVEL5_PURPOSES = frozenset(
+    {
+        "retail", "services", "transport", "dining", "grocery", "pharmacy", "healthcare",
+        "entertainment", "subscription", "digital services", "fuel", "travel", "mobile recharge",
+    }
+)
+# Business words of 7+ letters. They count when a narration token starts or ends
+# with one, because statements fuse names ("SAGARENTERPRISE", "ABCTRADERS").
+LONG_BUSINESS_WORDS = frozenset(
+    {
+        "enterprise", "enterprises", "traders", "trading", "industries", "agencies",
+        "lubricants", "associates", "engineering", "electricals", "electronics",
+        "hardware", "textiles", "garments", "distributors", "suppliers", "services",
+        "solutions", "logistics", "constructions", "construction", "pharmacy",
+        "furniture", "jewellers", "jewellery", "stationery", "provisions",
+    }
+)
+# A real Airtel narration (recharge, bill, merchant) is an Airtel merchant. The
+# bank "Airtel Payments Bank" (also fused as "AirtelPaymentsBank") is not.
+AIRTEL_MERCHANT_RE = re.compile(
+    r"(?<![a-z])airtel(?!\s*(?:payments?\s*)?bank)", flags=re.IGNORECASE
+)
+
+
+def _has_long_business_word(text: str) -> bool:
+    """Return True when a token starts or ends with a long business word."""
+
+    for token in re.findall(r"[a-z]+", str(text or "").lower()):
+        for word in LONG_BUSINESS_WORDS:
+            if len(word) >= 7 and len(token) >= len(word) and (token.startswith(word) or token.endswith(word)):
+                return True
+    return False
+
+
+def apply_counterparty_purpose_compat(
+    particulars: str,
+    result: dict[str, str],
+    debit_value: object = None,
+    credit_value: object = None,
+    part_texts: list[str] | None = None,
+) -> dict[str, str]:
+    """Settle a p2p row that carries a merchant-only Level 5 purpose.
+
+    A person is not a retailer, a restaurant or a fuel station. For a Level 3
+    ``p2p`` row whose Level 5 is a merchant purpose:
+
+    - if the narration supports that purpose (a NARRATION_LEVEL5_PATTERNS match
+      for the same purpose, a real Airtel narration for mobile recharge) or
+      names a business (BUSINESS_WORD_RE, or a long business word at the start
+      or end of a token), the counterparty is a merchant: Level 3 -> merchant;
+    - otherwise the purpose is unsupported: Level 5 is cleared, Level 3 stays
+      p2p, and the default "p2p transfer" purpose is restored.
+
+    Runs as the last step of the per-row chain.
+    """
+
+    if result.get("Level_3") != "p2p":
+        return result
+    purpose = _normalize_compare(result.get("Level_5", ""))
+    if purpose not in MERCHANT_LEVEL5_PURPOSES:
+        return result
+
+    text = _marker_text(particulars, part_texts)
+    supported = any(
+        pattern_purpose == purpose and pattern.search(text)
+        for pattern, pattern_purpose in NARRATION_LEVEL5_PATTERNS
+    )
+    if purpose == "mobile recharge" and AIRTEL_MERCHANT_RE.search(text):
+        supported = True
+
+    if supported or BUSINESS_WORD_RE.search(text) or _has_long_business_word(text):
+        result["Level_3"] = "merchant"
+        return result
+
+    result["Level_5"] = ""
+    direction = derive_direction_from_amounts(debit_value, credit_value)
+    automated_debit = bool(SYSTEM_INITIATED_RE.search(text)) and direction == "debit"
+    if not automated_debit:
+        result["Level_5"] = "p2p transfer"
+    return result
+
+
 SALARY_CHEQUE_RAIL_RE = re.compile(r"\b(?:CLG|CLEARING|CHEQUE|CHQ|CHEQ)\b", flags=re.IGNORECASE)
 
 
@@ -2049,6 +2189,38 @@ USER_INITIATED_RE = re.compile(
 )
 
 
+# Events the bank itself originates, whatever the customer did: charges and fees
+# (BANK_CHARGE_RE: "Dr Card Charges GST", "ATM Decline Chgs Incl GST", "RTN CHG"),
+# interest (INT_COLL_RE: "Int.Pd", "Int.Coll"; "Int on delayed ..."), and
+# reversals of UPI / card transactions ("UPIRET-...", "CRV POS ...").
+BANK_ORIGINATED_RE = re.compile(
+    "|".join(
+        f"(?:{pattern})"
+        for pattern in (
+            BANK_CHARGE_RE.pattern,
+            INT_COLL_RE.pattern,
+            r"\bInt\s+on\s+delayed\b",
+            r"^\s*(?:UPI\s*RET|CRV\s+POS)\b",
+        )
+    ),
+    flags=re.IGNORECASE,
+)
+BANK_ORIGINATED_LEVEL5 = frozenset({"charges", "interest", "dividend"})
+# Rows that keep the customer-initiated default even if a bank-originated word
+# appears: wallet load / unload and UPI P2A (person-to-account) transfers.
+LEVEL2_USER_RE = re.compile(r"\bUPI\b.*\bP2A\b|\bP2A\b", flags=re.IGNORECASE)
+
+
+def _is_bank_originated(row: pd.Series, particulars: str) -> bool:
+    """Return True for a bank-originated event (see BANK_ORIGINATED_RE)."""
+
+    level_1 = str(row.get("Level_1", "") or "").strip().lower()
+    level_5 = str(row.get("Level_5", "") or "").strip().lower()
+    if level_1 == "wallet" or level_5.startswith("wallet") or LEVEL2_USER_RE.search(particulars):
+        return False
+    return bool(BANK_ORIGINATED_RE.search(particulars)) or level_5 in BANK_ORIGINATED_LEVEL5
+
+
 def apply_strict_level2(df: pd.DataFrame) -> pd.DataFrame:
     """Assign a complete, rule-based initiation mode to every transaction."""
     output_df = df.copy()
@@ -2061,6 +2233,9 @@ def apply_strict_level2(df: pd.DataFrame) -> pd.DataFrame:
             output_df.at[idx, "Level_2"] = "System generated"
 
         elif row.get("IsSalary", 0) == 1:
+            output_df.at[idx, "Level_2"] = "System generated"
+
+        elif _is_bank_originated(row, particulars):
             output_df.at[idx, "Level_2"] = "System generated"
 
     return output_df
@@ -2514,6 +2689,13 @@ class BankStatementClassifier:
                 output_df.loc[row_index, "Debit"],
                 output_df.loc[row_index, "Credit"],
                 row_prediction,
+            )
+            row_prediction = apply_counterparty_purpose_compat(
+                str(output_df.loc[row_index, "Particulars"]),
+                row_prediction,
+                output_df.loc[row_index, "Debit"],
+                output_df.loc[row_index, "Credit"],
+                [part_text for part_text, _ in row_parts],
             )
             row_level_predictions.append(row_prediction)
 

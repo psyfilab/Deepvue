@@ -64,6 +64,30 @@ def load_config(config_path: str) -> dict[str, Any]:
         return yaml.safe_load(file_handle)
 
 
+def alias_in_keyword(alias: str, cleaned: str) -> bool:
+    """Return True when an alias matches whole tokens of a cleaned keyword.
+
+    The alias (spaces ignored) must equal one token or several consecutive
+    tokens joined together, so "ola" matches "ola cabs" and "ola" but not
+    "adimoolam n" or "solarcare india private". Joining consecutive tokens keeps
+    names that statements split across words ("rz p", "pine labs") matching.
+    """
+
+    target = str(alias or "").replace(" ", "")
+    if not target:
+        return False
+    tokens = str(cleaned or "").split()
+    for start in range(len(tokens)):
+        joined = ""
+        for token in tokens[start:]:
+            joined += token
+            if joined == target:
+                return True
+            if not target.startswith(joined):
+                break
+    return False
+
+
 def resolve_path(base_dir: Path, raw_path: str) -> Path:
     """Resolve a config path relative to the repository root."""
 
@@ -294,7 +318,8 @@ class KeywordClassifier:
                 key=lambda item: len(item[0]),
                 reverse=True,
             ):
-                if alias in compact:
+                # Whole-token match: "ola" must not fire inside "adimoolam" or "solarcare".
+                if alias in compact and alias_in_keyword(alias, cleaned):
                     result.update({key: value for key, value in payload.items() if value})
                     if payload.get("Level_3"):
                         self._set_level3(
