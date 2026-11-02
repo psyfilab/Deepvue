@@ -318,8 +318,9 @@ class KeywordClassifier:
                 key=lambda item: len(item[0]),
                 reverse=True,
             ):
-                # Whole-token match: "ola" must not fire inside "adimoolam" or "solarcare".
-                if alias in compact and alias_in_keyword(alias, cleaned):
+                # Aliases of 5 letters or fewer must equal a token ("solar" must not fire
+                # inside "solarcare"); longer aliases keep the substring match.
+                if alias in compact and (len(alias) > 5 or alias_in_keyword(alias, cleaned)):
                     result.update({key: value for key, value in payload.items() if value})
                     if payload.get("Level_3"):
                         self._set_level3(

@@ -423,23 +423,96 @@ MANUAL_MERCHANT_HINTS: dict[str, dict[str, str]] = {
     "starbucks": {"Level_3": "merchant", "Level_5": "dining", "Level_6": "starbucks"},
 }
 
+def _tok(*alternatives: str) -> str:
+    """Regex for short words (5 letters or fewer) that must stand alone as a token.
+
+    No letter may sit on either side, so "lic" matches "LIC PREMIUM" but not
+    "POLICE" or "SLICE", and "gas" matches "GAS BILL" but not "VEGAS". Words of 6
+    letters or more keep the looser substring match.
+    """
+
+    return r"(?<![a-z])(?:" + "|".join(alternatives) + r")(?![a-z])"
+
+
 PURPOSE_PATTERNS: list[tuple[re.Pattern[str], str]] = [
-    (re.compile(r"\btax\b|gst|itdtax|stax", re.IGNORECASE), "tax"),
-    (re.compile(r"\bsalary|payroll|wages|labour|sal\b", re.IGNORECASE), "salary"),
-    (re.compile(r"credit card|ccbp|cc payment", re.IGNORECASE), "credit card"),
-    (re.compile(r"\bemi\b|loan repay|loan emi|intrest emi|interest emi", re.IGNORECASE), "loan repayment"),
-    (re.compile(r"recharge|topup", re.IGNORECASE), "mobile recharge"),
-    (re.compile(r"electricity|water|gas|lpg|billdesk|billpay|utility|broadband|dth", re.IGNORECASE), "utilities"),
-    (re.compile(r"pharm|medplus|1mg|pharmeasy|\bmed\b|medicals?|chemist", re.IGNORECASE), "pharmacy"),
-    (re.compile(r"zomato|swiggy|food|restaurant|cafe|pizza|burger", re.IGNORECASE), "dining"),
-    (re.compile(r"blinkit|zepto|grofers|grocery|instamart|mart", re.IGNORECASE), "grocery"),
-    (re.compile(r"netflix|spotify|prime|monthly|subscription", re.IGNORECASE), "subscription"),
-    (re.compile(r"irctc|rail|metro|uber|ola|rapido|bus|ticket|travel", re.IGNORECASE), "transport"),
-    (re.compile(r"paytm|gpay|googlepay|phonepe|razorpay|cashfree|freecharge|payu|bharatpe", re.IGNORECASE), "digital services"),
+    (re.compile(r"\btax\b|" + _tok("[cis]?gst", "stax") + r"|itdtax", re.IGNORECASE), "tax"),
+    (re.compile(r"\bsalary|payroll|labour|" + _tok("wages") + r"|\bsal\b", re.IGNORECASE), "salary"),
+    (re.compile(r"credit card|" + _tok("ccbp") + r"|cc payment", re.IGNORECASE), "credit card"),
+    (
+        re.compile(
+            r"\bemi\b|loan repay|loan emi|intrest emi|interest emi"
+            # IDFC FIRST with a LOAN ACC / LOAN A/C reference, in either order.
+            r"|\bidfc\s*first\b.*\bloan\s*a(?:/?c|cc(?:ount)?)\b"
+            r"|\bloan\s*a(?:/?c|cc(?:ount)?)\b.*\bidfc\s*first",
+            re.IGNORECASE,
+        ),
+        "loan repayment",
+    ),
+    (re.compile(r"recharge|" + _tok("topup"), re.IGNORECASE), "mobile recharge"),
+    (
+        re.compile(
+            r"electricity|" + _tok("water", "gas", "lpg", "dth") + r"|billdesk|billpay|utility|broadband",
+            re.IGNORECASE,
+        ),
+        "utilities",
+    ),
+    (
+        re.compile(
+            _tok(r"pharm(?:a(?:c[a-z]*)?)?", "1mg")
+            + r"|medplus|pharmeasy|\bmed\b|medicals?|chemist",
+            re.IGNORECASE,
+        ),
+        "pharmacy",
+    ),
+    (
+        re.compile(
+            r"zomato|swiggy|restaurant|burger|" + _tok("foods?", "cafes?", "pizzas?"),
+            re.IGNORECASE,
+        ),
+        "dining",
+    ),
+    (
+        re.compile(
+            r"blinkit|grofers|grocery|instamart|" + _tok("zepto", "mart", "dmart"),
+            re.IGNORECASE,
+        ),
+        "grocery",
+    ),
+    (
+        re.compile(r"netflix|spotify|primevideo|monthly|subscription|" + _tok("prime"), re.IGNORECASE),
+        "subscription",
+    ),
+    # PUMP and FUEL words are fuel, not transport (checked before the transport row).
+    (re.compile(_tok("fuels?", "pumps?"), re.IGNORECASE), "fuel"),
+    # ola / bus / rail are short enough to sit inside other words (ADIMOOLAM, SOLARCARE,
+    # BUSINESS, TRAILER), so they match as whole words only. "olacabs" and "ola cab(s)"
+    # are listed explicitly; the longer words keep their loose match.
+    (
+        re.compile(
+            r"\b(?:ola(?:\s?cabs?)?|bus(?:es)?|rail(?:ways?)?)\b|"
+            + _tok(r"uber(?:india)?", "irctc", "metro")
+            + r"|rapido|ticket|travel",
+            re.IGNORECASE,
+        ),
+        "transport",
+    ),
+    (
+        re.compile(
+            r"googlepay|phonepe|razorpay|cashfree|freecharge|bharatpe|" + _tok("paytm", "gpay", "payu"),
+            re.IGNORECASE,
+        ),
+        "digital services",
+    ),
     (re.compile(r"amazon|flipkart|myntra|meesho|retail", re.IGNORECASE), "retail"),
     (re.compile(r"service|vyapar|professional|consult", re.IGNORECASE), "services"),
-    (re.compile(r"insurance|policy|premium|lic|acko|ergo|bupa", re.IGNORECASE), "insurance"),
-    (re.compile(r"groww|zerodha|upstox|mutual fund|sip|nps|investment", re.IGNORECASE), "financial services"),
+    (re.compile(r"insurance|policy|premium|" + _tok("lic", "acko", "ergo", "bupa"), re.IGNORECASE), "insurance"),
+    (
+        re.compile(
+            r"zerodha|upstox|mutual fund|investment|" + _tok("groww", "sip", "nps", "slice"),
+            re.IGNORECASE,
+        ),
+        "financial services",
+    ),
 ]
 
 PURPOSE_NORMALIZATION: dict[str, str] = {
@@ -602,6 +675,23 @@ def detect_counterparty_marker(keyword: str) -> str:
     return ""
 
 
+def _equals_token(cue: str, tokens: list[str]) -> bool:
+    """Return True when a compact cue equals one token, or consecutive tokens joined.
+
+    Joining keeps cues built from a keyword the statement split across words.
+    """
+
+    for start in range(len(tokens)):
+        joined = ""
+        for token in tokens[start:]:
+            joined += token
+            if joined == cue:
+                return True
+            if not cue.startswith(joined):
+                break
+    return False
+
+
 def detect_level5_keyword_cue(
     keyword: str,
     level5_keyword_cues: dict[str, str],
@@ -611,13 +701,20 @@ def detect_level5_keyword_cue(
     compact_keyword = compact_text(keyword)
     if not compact_keyword:
         return ""
+    tokens = normalize_spaces(keyword).split()
 
     for cue, label in sorted(
         level5_keyword_cues.items(),
         key=lambda item: len(item[0]),
         reverse=True,
     ):
-        if cue and cue in compact_keyword:
+        if not cue:
+            continue
+        # A cue of 5 letters or fewer must equal a token ("police" never gives "lic").
+        if len(cue) <= 5:
+            if _equals_token(cue, tokens):
+                return label
+        elif cue in compact_keyword:
             return label
     return ""
 

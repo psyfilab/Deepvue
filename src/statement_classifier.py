@@ -292,8 +292,9 @@ IFSC_PREFIX_TO_BANK = {**BANK_CODE_TO_NAME, "icic": "icici bank"}
 IFSC_RE = re.compile(r"^[A-Z]{4}0[A-Z0-9]{6}$")
 
 PLATFORM_ALIASES = {
-    "google pay": ("google pay", "googlepay", "gpay", "tez"),
+    "google pay": ("google pay", "googlepay", "gpay", "tez", "okbizaxis", "okpayaxis"),
     "phonepe": ("phonepe", "phone pe"),
+    "jupiter": ("jupiteraxis",),
     "paytm": ("paytm", "paytm upi", "paytm payments bank"),
     "amazon pay": ("amazon pay", "amazonpay"),
     "bhim": ("bhim", "bharat interface for money"),
@@ -343,9 +344,31 @@ UPI_APP_HANDLES = {
     "ybl": "phonepe",
     "ibl": "phonepe",
     "axl": "phonepe",
+    # Paytm handles name the platform, not the bank behind them.
+    "ptyes": "paytm",
+    "ptys": "paytm",
+    "ptybl": "paytm",
+    "ptsbi": "paytm",
+    "ptaxis": "paytm",
+    "pty": "paytm",
+    "paytm": "paytm",
+    "slc": "slice",
+    "okbizaxis": "google pay",
+    "okpayaxis": "google pay",
+    "jupiteraxis": "jupiter",
 }
+# Handles that statements cut mid-word ("@JUPITERA XIS", "@OKBIZAX IS") are matched with
+# spaces allowed between their letters, i.e. as if the spaces were removed.
+UPI_SPACE_TOLERANT_HANDLES = frozenset({"okbizaxis", "okpayaxis", "jupiteraxis"})
+# Platforms known from a UPI handle (slice has no narration alias of its own).
+UPI_HANDLE_PLATFORMS = frozenset(UPI_APP_HANDLES.values())
 UPI_APP_HANDLE_RE = re.compile(
-    r"@\s*(okhdfcbank|okhdfc|okicici|oksbi|okaxis|ybl|ibl|axl)(?![a-z0-9])"
+    r"@\s*("
+    + "|".join(
+        r"\s*".join(re.escape(char) for char in handle) if handle in UPI_SPACE_TOLERANT_HANDLES else handle
+        for handle in sorted(UPI_APP_HANDLES, key=len, reverse=True)
+    )
+    + r")(?![a-z0-9])"
 )
 
 BANK_ALIASES = {
@@ -469,7 +492,7 @@ def detect_level_4_platform_or_bank(text: str) -> str:
 
     handle_match = UPI_APP_HANDLE_RE.search(normalized)
     if handle_match:
-        return UPI_APP_HANDLES[handle_match.group(1)]
+        return UPI_APP_HANDLES[re.sub(r"\s+", "", handle_match.group(1))]
 
     bank_matches = []
     for canonical, aliases in BANK_ALIASES.items():
@@ -499,7 +522,11 @@ def _is_platform_label(label: str) -> bool:
     """
 
     value = _normalize_compare(label)
-    return bool(value) and (value in PLATFORM_ALIASES or is_payment_intermediary_label(value))
+    return bool(value) and (
+        value in PLATFORM_ALIASES
+        or value in UPI_HANDLE_PLATFORMS
+        or is_payment_intermediary_label(value)
+    )
 
 
 NARRATION_LEVEL5_PATTERNS: list[tuple[re.Pattern[str], str]] = [
@@ -607,7 +634,7 @@ NARRATION_LEVEL5_PATTERNS: list[tuple[re.Pattern[str], str]] = [
     ),
     (
         re.compile(
-            r"\b(?:petrol|diesel|fuel|hpcl|iocl|bpcl|hp\s*petrol"
+            r"\b(?:petrol|diesel|fuels?|pumps?|hpcl|iocl|bpcl|hp\s*petrol"
             r"|cng\s*station|gas\s*station|shell|petrol\s*pump"
             r"|fuel\s*station|bharat\s*petroleum|indian\s*oil)\b",
             re.IGNORECASE,
@@ -644,7 +671,7 @@ NARRATION_LEVEL5_PATTERNS: list[tuple[re.Pattern[str], str]] = [
     ),
     (
         re.compile(
-            r"\b(?:groww|zerodha|upstox|kuvera|smallcase|paytm\s*money"
+            r"\b(?:groww|zerodha|upstox|kuvera|smallcase|slice|paytm\s*money"
             r"|mutual\s*fund|sip\s*payment|sip\s*debit|nps\s*contribution"
             r"|demat|ppf\s*deposit|fd\s*deposit|rd\s*deposit|investment)\b",
             re.IGNORECASE,
@@ -688,6 +715,18 @@ NARRATION_LEVEL5_PATTERNS: list[tuple[re.Pattern[str], str]] = [
 ]
 
 
+# IDFC FIRST with a LOAN ACC / LOAN A/C reference is a loan repayment, in either order.
+IDFC_LOAN_ACC_RE = re.compile(
+    r"(?=.*\bidfc\s*first)(?=.*\bloan\s*a(?:/?c|cc(?:ount)?)\b)", flags=re.IGNORECASE
+)
+# Jio as a merchant is a mobile recharge (like Airtel). Jio Payments Bank, Jio Finance,
+# JioMart, JioCinema, JioSaavn and Jio Fiber are other things, so they do not count.
+JIO_MERCHANT_RE = re.compile(
+    r"(?<![a-z])jio(?![a-z])(?!\s*(?:payments?\s*bank|finance|financial|mart|cinema|saavn|fib(?:er|re)))",
+    flags=re.IGNORECASE,
+)
+
+
 def apply_narration_purpose_override(
     particulars: str,
     result: dict[str, str],
@@ -697,14 +736,30 @@ def apply_narration_purpose_override(
 ) -> dict[str, str]:
     """Fill a blank Level 5 purpose from the full narration when keyword model left it empty."""
 
+    text = _marker_text(particulars, part_texts)
+    direction = derive_direction_from_amounts(debit_value, credit_value)
+
+    # IDFC FIRST loan account: the narration states the purpose, so it replaces a
+    # model purpose too. A credit (disbursal, refund) is not a repayment.
+    if (
+        result.get("Level_1") != "cash"
+        and direction != "credit"
+        and IDFC_LOAN_ACC_RE.search(text)
+    ):
+        result["Level_5"] = "loan repayment"
+        if result.get("Level_3") in {"", "p2p"}:
+            result["Level_3"] = "institution"
+        return result
+
     if result.get("Level_5"):
         return result
 
     if result.get("Level_1") == "cash":
         return result
 
-    text = _marker_text(particulars, part_texts)
-    direction = derive_direction_from_amounts(debit_value, credit_value)
+    if result.get("Level_3") == "merchant" and JIO_MERCHANT_RE.search(text):
+        result["Level_5"] = "mobile recharge"
+        return result
 
     for pattern, purpose in NARRATION_LEVEL5_PATTERNS:
         if not pattern.search(text):
@@ -1463,6 +1518,13 @@ def apply_atm_withdrawal_overrides(
 # Level 3 evidence that the counterparty cannot be a person.
 #   Bank charges: "RTN CHG-...", "IMPS Chg May-25+GST", "Chq rtn Chg ..."
 BANK_CHARGE_RE = re.compile(r"^\s*(?:[a-z]+\s+){0,3}(?:chg|chgs|charges?)\b", flags=re.IGNORECASE)
+#   Bank fee lines BANK_CHARGE_RE misses: "ATM / IMPS TRANSACTION CHARGES", "SMS CHARGES",
+#   "IMPS SC CHQ" and the reversal "REV PART ATM / IMPS TRANSACTION CHARGE".
+BANK_FEE_NARRATION_RE = re.compile(
+    r"^\s*(?:REV(?:ERSAL)?\s+(?:PART\s+)?)?"
+    r"(?:ATM\s*/\s*IMPS\s+TRANSACTION\s+CHARGES?|SMS\s+CHARGES?|IMPS\s+SC\s+CHQ)\b",
+    flags=re.IGNORECASE,
+)
 #   Government payee: ".../CHALLAN 280 TAX/GOVT/", ".../PF CONTRIBUTION/GOVT/"
 GOVERNMENT_PAYEE_RE = re.compile(r"(?:^|/)\s*GOVT\s*(?:/|$)|\bCHALLAN\b", flags=re.IGNORECASE)
 #   Mandate debits (NACH / ECS / auto-debit / standing instruction). Mandates are
@@ -1741,6 +1803,7 @@ FIRST_LEVEL_FALLBACKS: list[tuple[re.Pattern[str], str]] = [
     (re.compile(r"^\s*(?:UPI\s*RET|CRV\s+POS)\b", re.IGNORECASE), "Refund/Reversal"),
     # Bank charges: "RTN CHG-...", "IMPS Chg May-25+GST", "Chq rtn Chg ..."
     (BANK_CHARGE_RE, "Bank Charges"),
+    (BANK_FEE_NARRATION_RE, "Bank Charges"),
     # Interest: "...:Int.Coll:...", "...:Int.Pd:...", "INTEREST PAID TILL ..."
     (re.compile(r"\bInt\.\s*(?:Coll|Pd)\b|\bINTEREST\s+(?:PAID|CREDITED|COLLECTED)\b", re.IGNORECASE), "Interest"),
     # Dividends: "DR REDDYS DIV 23 ...", "ACH C- HCL 1ST INTDIV24 ...", and codes
@@ -1901,7 +1964,7 @@ def apply_counterparty_purpose_compat(
         pattern_purpose == purpose and pattern.search(text)
         for pattern, pattern_purpose in NARRATION_LEVEL5_PATTERNS
     )
-    if purpose == "mobile recharge" and AIRTEL_MERCHANT_RE.search(text):
+    if purpose == "mobile recharge" and (AIRTEL_MERCHANT_RE.search(text) or JIO_MERCHANT_RE.search(text)):
         supported = True
 
     if supported or BUSINESS_WORD_RE.search(text) or _has_long_business_word(text):
@@ -1968,6 +2031,16 @@ def apply_pre_detect_salary_overrides(df: pd.DataFrame) -> pd.DataFrame:
             output_df.at[idx, "Level_3"] = "institution"
             output_df.at[idx, "Level_5"] = "charges"
             output_df.at[idx, "Level_6"] = "bank charges"
+            continue
+
+        # Rule 1b: bank fee narrations -> institution / charges, no counterparty name
+        if BANK_FEE_NARRATION_RE.match(text):
+            output_df.at[idx, "Level_3"] = "institution"
+            output_df.at[idx, "Level_5"] = "charges"
+            output_df.at[idx, "Level_6"] = ""
+            row = output_df.loc[idx]
+            output_df.at[idx, "First Level Classification"] = derive_first_level_classification(row)
+            output_df.at[idx, "Second Level Classification"] = derive_second_level_classification(row)
             continue
 
         # Rule 2: ACH credit + dividend
@@ -2198,6 +2271,7 @@ BANK_ORIGINATED_RE = re.compile(
         f"(?:{pattern})"
         for pattern in (
             BANK_CHARGE_RE.pattern,
+            BANK_FEE_NARRATION_RE.pattern,
             INT_COLL_RE.pattern,
             r"\bInt\s+on\s+delayed\b",
             r"^\s*(?:UPI\s*RET|CRV\s+POS)\b",
