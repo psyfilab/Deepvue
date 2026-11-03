@@ -12,14 +12,14 @@ import pandas as pd
 # and direct module loading from the repository root / ``src`` directory.
 if __package__:
     from .predict import KeywordClassifier
-    from .prompt_part3 import clean_entity, detect_explicit_purpose
+    from .prompt_part3 import REAL_DIGITAL_BRANDS, brand_alternation, clean_entity, detect_explicit_purpose
 else:  # pragma: no cover - used by IDEs or scripts loading this file directly
     try:
         from src.predict import KeywordClassifier
-        from src.prompt_part3 import clean_entity, detect_explicit_purpose
+        from src.prompt_part3 import REAL_DIGITAL_BRANDS, brand_alternation, clean_entity, detect_explicit_purpose
     except ModuleNotFoundError:
         from predict import KeywordClassifier
-        from prompt_part3 import clean_entity, detect_explicit_purpose
+        from prompt_part3 import REAL_DIGITAL_BRANDS, brand_alternation, clean_entity, detect_explicit_purpose
 
 logger = logging.getLogger(__name__)
 
@@ -119,11 +119,28 @@ PAYTM_NUMERIC_VPA_RE = re.compile(r"(?:^|[-/])paytm-?\d+@paytm", flags=re.IGNORE
 MERCHANT_ORDER_ID_RE = re.compile(r"\bOID\d{6,}", flags=re.IGNORECASE)
 
 
+# Google Pay for Business: the "GPAY-<id>" payee prefix and the business-only handles are
+# evidence of a merchant. Handles are read from UPI_APP_HANDLES' business list below.
+GOOGLE_PAY_BUSINESS_HANDLES = ("okbizaxis", "okpayaxis")
+GOOGLE_PAY_BUSINESS_RE = re.compile(
+    r"(?:^|[-/])gpay-?\d*[a-z0-9.]*@|@(?:" + "|".join(GOOGLE_PAY_BUSINESS_HANDLES) + r")(?![a-z0-9])",
+    flags=re.IGNORECASE,
+)
+# A wallet top-up ("ADD MONEY TO WALLET") loads the payer's own wallet: a merchant payment.
+WALLET_TOPUP_RE = re.compile(
+    r"\badd\s*money\s*to\s*wallet\b|\bwallet\s*(?:top\s*up|topup|load|recharge)\b",
+    flags=re.IGNORECASE,
+)
+# Level 5 given to a wallet top-up. The Master Sheet's allowed Level 5 list has no wallet-load
+# value, so it stays blank; set it here if the list gains one.
+WALLET_TOPUP_LEVEL5 = ""
+
+
 def has_merchant_vpa(particulars: str) -> bool:
     """Return True when the narration's UPI ID is a merchant-only ID."""
 
     compact = re.sub(r"\s+", "", str(particulars or ""))
-    if MERCHANT_VPA_RE.search(compact):
+    if MERCHANT_VPA_RE.search(compact) or GOOGLE_PAY_BUSINESS_RE.search(compact):
         return True
     return bool(PAYTM_NUMERIC_VPA_RE.search(compact) and MERCHANT_ORDER_ID_RE.search(compact))
 MERCHANT_MARKER_RE = re.compile(
@@ -356,16 +373,21 @@ UPI_APP_HANDLES = {
     "okbizaxis": "google pay",
     "okpayaxis": "google pay",
     "jupiteraxis": "jupiter",
+    # Google Pay handles that statements cut mid-word ("@OKH", "@OKHDF", "@OKI", "@OKS").
+    "okh": "google pay",
+    "okhdf": "google pay",
+    "oki": "google pay",
+    "oks": "google pay",
 }
-# Handles that statements cut mid-word ("@JUPITERA XIS", "@OKBIZAX IS") are matched with
-# spaces allowed between their letters, i.e. as if the spaces were removed.
-UPI_SPACE_TOLERANT_HANDLES = frozenset({"okbizaxis", "okpayaxis", "jupiteraxis"})
+# Every handle is matched with spaces allowed between its letters ("@JUPITERA XIS",
+# "@OKBIZAX IS", "@OKHDF CBANK"), i.e. as if the spaces were removed.
+UPI_SPACE_TOLERANT_HANDLES = frozenset(UPI_APP_HANDLES)
 # Platforms known from a UPI handle (slice has no narration alias of its own).
 UPI_HANDLE_PLATFORMS = frozenset(UPI_APP_HANDLES.values())
 UPI_APP_HANDLE_RE = re.compile(
     r"@\s*("
     + "|".join(
-        r"\s*".join(re.escape(char) for char in handle) if handle in UPI_SPACE_TOLERANT_HANDLES else handle
+        r"\s*".join(re.escape(char) for char in handle) if handle in UPI_SPACE_TOLERANT_HANDLES else re.escape(handle)
         for handle in sorted(UPI_APP_HANDLES, key=len, reverse=True)
     )
     + r")(?![a-z0-9])"
@@ -612,7 +634,7 @@ NARRATION_LEVEL5_PATTERNS: list[tuple[re.Pattern[str], str]] = [
     (
         re.compile(
             r"\b(?:grocery|groceries|blinkit|zepto|bigbasket|grofers"
-            r"|jiomart|instamart|swiggy\s*instamart|supermarket|kirana|fresh\s*mart|sabji"
+            r"|jiomart|instamart|swiggy\s*instamart|supermarket|super\s*mark(?:et)?|marts?|kirana|fresh\s*mart|sabji"
             r"|vegetable|fruit\s*shop|daily\s*needs|ever\s*green\s*fresh"
             r"|milk\s*booth|dairy|sorabh\s*dairy)\b",
             re.IGNORECASE,
@@ -621,7 +643,7 @@ NARRATION_LEVEL5_PATTERNS: list[tuple[re.Pattern[str], str]] = [
     ),
     (
         re.compile(
-            r"\b(?:restaurant|zomato|swiggy|cafe|dhaba|food\s*court"
+            r"\b(?:restaurant|zomato|swiggy|cafe|dhaba|food\s*court|foods?|kachori|coffee|brew|mithai"
             r"|pizza|burger|kfc|mcdonalds|dominos?|biryani|diner"
             r"|bakery|confectionery|sweet\s*shop|juice\s*bar|tea\s*stall"
             r"|mess|canteen|tiffin|bar\s*and\s*grill"
@@ -634,9 +656,11 @@ NARRATION_LEVEL5_PATTERNS: list[tuple[re.Pattern[str], str]] = [
     ),
     (
         re.compile(
-            r"\b(?:petrol|diesel|fuels?|pumps?|hpcl|iocl|bpcl|hp\s*petrol"
+            r"\b(?:petrol|diesel|fuels?|filling|pumps?|hpcl|iocl|bpcl|hp\s*petrol"
             r"|cng\s*station|gas\s*station|shell|petrol\s*pump"
-            r"|fuel\s*station|bharat\s*petroleum|indian\s*oil)\b",
+            r"|fuel\s*station|bharat\s*petroleum|indian\s*oil)\b"
+            # fused compound name: "NELLOREPOLICEFUELST" (fuel + station suffix)
+            r"|[a-z]fuel(?:st|stn|stat|station|pump)",
             re.IGNORECASE,
         ),
         "fuel",
@@ -705,19 +729,30 @@ NARRATION_LEVEL5_PATTERNS: list[tuple[re.Pattern[str], str]] = [
         "retail",
     ),
     (
-        re.compile(
-            r"\b(?:paytm|gpay|google\s*pay|phonepe|razorpay|cashfree"
-            r"|freecharge|payu|bharatpe|billdesk|juspay|mobikwik)\b",
-            re.IGNORECASE,
-        ),
+        # Real digital brands only; a payment platform never sets Level 5.
+        re.compile(r"(?<![a-z])(?:" + brand_alternation(REAL_DIGITAL_BRANDS) + r")(?![a-z])", re.IGNORECASE),
         "digital services",
     ),
 ]
 
 
 # IDFC FIRST with a LOAN ACC / LOAN A/C reference is a loan repayment, in either order.
+# Name evidence strong enough to make a row a merchant even when the model said p2p:
+# a fuel-station compound ("NELLOREPOLICEFUELST"), "fuel station", "petrol pump".
+P2P_OVERRIDING_EVIDENCE: tuple[tuple[re.Pattern, str], ...] = (
+    (
+        re.compile(
+            r"[a-z]fuel(?:st|stn|stat|station|pump)|(?<![a-z])fuel\s*(?:station|pump)(?![a-z])"
+            r"|(?<![a-z])petrol\s*pump(?![a-z])",
+            flags=re.IGNORECASE,
+        ),
+        "fuel",
+    ),
+)
+JIO_EXACT_PARTS = frozenset({"jio", "jiop"})
+IDFC_LENDER_NAME = "idfc first bank"
 IDFC_LOAN_ACC_RE = re.compile(
-    r"(?=.*\bidfc\s*first)(?=.*\bloan\s*a(?:/?c|cc(?:ount)?)\b)", flags=re.IGNORECASE
+    r"(?=.*\bidfc\b)(?=.*\bloan\s*a(?:/?c|cc(?:ount)?)\b)", flags=re.IGNORECASE
 )
 # Jio as a merchant is a mobile recharge (like Airtel). Jio Payments Bank, Jio Finance,
 # JioMart, JioCinema, JioSaavn and Jio Fiber are other things, so they do not count.
@@ -725,6 +760,70 @@ JIO_MERCHANT_RE = re.compile(
     r"(?<![a-z])jio(?![a-z])(?!\s*(?:payments?\s*bank|finance|financial|mart|cinema|saavn|fib(?:er|re)))",
     flags=re.IGNORECASE,
 )
+
+
+REAL_DIGITAL_BRAND_RE = re.compile(
+    r"(?<![a-z])(?:" + brand_alternation(REAL_DIGITAL_BRANDS) + r")(?![a-z])", flags=re.IGNORECASE
+)
+
+
+# When several purpose patterns match one text, the more specific purpose wins over the
+# generic one ("SUPRA FUEL MART" is fuel, not grocery). Data, not logic: extend per purpose.
+PURPOSE_SPECIFICITY: dict[str, frozenset[str]] = {
+    "fuel": frozenset({"grocery", "retail", "services"}),
+    "pharmacy": frozenset({"retail", "services"}),
+    "healthcare": frozenset({"services"}),
+}
+# Purposes that must never be inferred from a merchant name alone.
+NAME_EVIDENCE_EXCLUDED_PURPOSES = frozenset({"salary", "credit card", "digital services"})
+
+
+def _platform_name_regex() -> re.Pattern:
+    """Every platform / gateway alias from PLATFORM_ALIASES as one token-bounded regex, so
+    the platform list lives in one place."""
+
+    aliases = {a for names in PLATFORM_ALIASES.values() for a in names} | set(PLATFORM_ALIASES)
+    body = "|".join(
+        r"\s*".join(re.escape(ch) for ch in alias.replace(" ", ""))
+        for alias in sorted(aliases, key=len, reverse=True)
+    )
+    return re.compile(r"(?<![a-z])(?:" + body + r")(?![a-z])", re.IGNORECASE)
+
+
+PLATFORM_NAME_RE = _platform_name_regex()
+
+
+def _matched_purposes(text: str, skip: frozenset[str] = frozenset()) -> list[str]:
+    """Every purpose in NARRATION_LEVEL5_PATTERNS whose pattern matches the text, in order."""
+
+    found: list[str] = []
+    for pattern, purpose in NARRATION_LEVEL5_PATTERNS:
+        if purpose not in skip and purpose not in found and pattern.search(text):
+            found.append(purpose)
+    return found
+
+
+def _most_specific_purpose(purposes: list[str]) -> str:
+    for purpose in purposes:
+        if any(purpose in PURPOSE_SPECIFICITY.get(other, ()) for other in purposes):
+            continue
+        return purpose
+    return purposes[0] if purposes else ""
+
+
+def apply_platform_purpose_guard(
+    particulars: str, result: dict[str, str], part_texts: list[str] | None = None
+) -> dict[str, str]:
+    """A payment platform (Paytm, BharatPe, Amazon Pay, Google Pay, PhonePe...) never sets
+    Level 5. `digital services` stays only for a real digital brand in the narration or
+    the Level 6 name; otherwise it is cleared so evidence-only logic can fill it."""
+
+    if result.get("Level_5") != "digital services":
+        return result
+    evidence = f"{_marker_text(particulars, part_texts)} {result.get('Level_6', '')}"
+    if not REAL_DIGITAL_BRAND_RE.search(evidence):
+        result["Level_5"] = ""
+    return result
 
 
 def apply_narration_purpose_override(
@@ -749,7 +848,36 @@ def apply_narration_purpose_override(
         result["Level_5"] = "loan repayment"
         if result.get("Level_3") in {"", "p2p"}:
             result["Level_3"] = "institution"
+        # Level 6 is the full lender name, never a cut piece of it ("idfc firs").
+        current = re.sub(r"[^a-z]", "", result.get("Level_6", "").lower())
+        lender = re.sub(r"[^a-z]", "", IDFC_LENDER_NAME)
+        if not current or (len(current) >= 4 and lender.startswith(current)):
+            result["Level_6"] = IDFC_LENDER_NAME
         return result
+
+    # A narration part that is exactly "jio" is the Jio merchant row of the Master Sheet;
+    # a p2p label on it is a mislabel (mobile recharge, like Airtel).
+    if (
+        result.get("Level_3") == "p2p"
+        and result.get("Level_5") in {"", "p2p transfer"}
+        and any(_normalize_compare(part) in JIO_EXACT_PARTS for part in (part_texts or []))
+    ):
+        result["Level_3"] = "merchant"
+        result["Level_5"] = "mobile recharge"
+        return result
+
+    # Unambiguous business-name evidence beats the default "p2p transfer" label.
+    if (
+        result.get("Level_1") != "cash"
+        and direction != "credit"
+        and result.get("Level_3") in {"", "p2p"}
+        and result.get("Level_5") in {"", "p2p transfer"}
+    ):
+        for pattern, purpose in P2P_OVERRIDING_EVIDENCE:
+            if pattern.search(text):
+                result["Level_3"] = "merchant"
+                result["Level_5"] = purpose
+                return result
 
     if result.get("Level_5"):
         return result
@@ -761,17 +889,28 @@ def apply_narration_purpose_override(
         result["Level_5"] = "mobile recharge"
         return result
 
-    for pattern, purpose in NARRATION_LEVEL5_PATTERNS:
-        if not pattern.search(text):
-            continue
-
-        if purpose == "salary" and direction == "debit":
-            continue
-        if purpose == "credit card" and direction == "credit":
-            continue
-
+    skip = set()
+    if direction == "debit":
+        skip.add("salary")
+    if direction == "credit":
+        skip.add("credit card")
+    # Platform names are rails, not evidence of what was bought: read the rest of the text.
+    purpose = _most_specific_purpose(
+        _matched_purposes(PLATFORM_NAME_RE.sub(" ", text), frozenset(skip))
+    )
+    if purpose:
         result["Level_5"] = purpose
-        break
+
+    # A merchant's own name is evidence too (KACHORI, COFFEE, SUPER MARK, FILLING...),
+    # read with the same whole-token patterns, so the result does not depend on the app.
+    if not result.get("Level_5") and result.get("Level_3") == "merchant" and result.get("Level_6"):
+        purpose = _most_specific_purpose(
+            _matched_purposes(
+                PLATFORM_NAME_RE.sub(" ", str(result["Level_6"])), NAME_EVIDENCE_EXCLUDED_PURPOSES
+            )
+        )
+        if purpose:
+            result["Level_5"] = purpose
 
     return result
 
@@ -802,6 +941,8 @@ def _normalize_compare(value: str) -> str:
     return "" if value is None else str(value).strip().lower()
 
 
+# Channel words that may precede the rail ("INET-IMPS-CR-<ref>-<NAME>"): not an entity.
+HYPHEN_RAIL_CHANNEL_PREFIXES = ("INET",)
 GENERIC_LEVEL6_WORDS = frozenset(
     {
         "to", "by", "from", "for", "via", "bill", "bills", "payment", "payments",
@@ -817,6 +958,8 @@ GENERIC_LEVEL6_WORDS = frozenset(
         "charges", "gst",
         # Card purchase prefix "ECOM PUR/<merchant>/...".
         "ecom", "pur",
+        # Internet-banking channel prefix ("INET-IMPS-CR-...").
+        *(word.lower() for word in HYPHEN_RAIL_CHANNEL_PREFIXES),
     }
 )
 # Counterparty position in common bank narration layouts (used for Level 6).
@@ -825,8 +968,14 @@ GENERIC_LEVEL6_WORDS = frozenset(
 #   INF|BIL/INFT/<ref>/.../<NAME>  in-bank net-banking transfers (name is last)
 #   MMT/IMPS/<rrn>/<remark>/<NAME>/<bank>
 #   TRFR TO|FROM: <NAME>           in-bank transfers
+# "INET-IMPS-CR/<NAME>/<bank>/<ref>...": the payee is the first slash segment after the rail.
+INET_SLASH_ENTITY_RE = re.compile(
+    r"^\s*(?:" + "|".join(HYPHEN_RAIL_CHANNEL_PREFIXES) + r")\s*-\s*(?:NEFT|RTGS|IMPS)\s*-\s*(?:CR|DR)\s*/([^/]+)/",
+    flags=re.IGNORECASE,
+)
 HYPHEN_RAIL_ENTITY_RE = re.compile(
-    r"^\s*(?:NEFT|RTGS|IMPS)(?:\s+RETURN)?-[A-Z0-9]*\d{5,}[A-Z0-9]*-([^-]+)",
+    r"^\s*(?:(?:" + "|".join(HYPHEN_RAIL_CHANNEL_PREFIXES) + r")-)?(?:NEFT|RTGS|IMPS)(?:\s+RETURN)?(?:-(?:CR|DR))?"
+    r"-[A-Z0-9]*\d{5,}[A-Z0-9]*-([^-]+)",
     flags=re.IGNORECASE,
 )
 CHEQUE_ENTITY_RE = re.compile(r"^\s*(?:CLG|TRF)/([^/]+)/", flags=re.IGNORECASE)
@@ -929,6 +1078,7 @@ def extract_level6_entity(particulars: str) -> str:
 
     text = str(particulars or "")
     for pattern in (
+        INET_SLASH_ENTITY_RE,
         HYPHEN_RAIL_ENTITY_RE,
         CHEQUE_ENTITY_RE,
         MMT_IMPS_ENTITY_RE,
@@ -1010,6 +1160,11 @@ def derive_direction_from_amounts(debit_value: object, credit_value: object) -> 
     return ""
 
 
+# Platforms that are themselves the counterparty: when the payee field names one, Level 6
+# keeps it even though Level 4 is the same platform.
+PAYEE_PLATFORM_LEVEL6 = frozenset({"slice"})
+
+
 def _apply_transaction_rules(
     result: dict[str, str],
     default_p2p_purpose: bool = True,
@@ -1056,6 +1211,11 @@ def _apply_transaction_rules(
         result["Level_4"]
         and result["Level_6"]
         and _normalize_compare(result["Level_4"]) == _normalize_compare(result["Level_6"])
+        and not (
+            confirmed_level6
+            and _normalize_compare(result["Level_6"]) == confirmed_level6
+            and confirmed_level6 in PAYEE_PLATFORM_LEVEL6
+        )
     ):
         result["Level_6"] = ""
 
@@ -1094,6 +1254,10 @@ def is_bank_only_part(part_text: str) -> bool:
     return all(word in BANK_NAME_WORDS for word in words)
 
 
+# Marker the row classifier puts on a part prediction that came from an exact Master lookup.
+EXACT_MASTER_KEY = "_exact_master"
+
+
 def aggregate_part_predictions(
     part_predictions: list[tuple[str, dict[str, str]]],
 ) -> dict[str, str]:
@@ -1105,6 +1269,14 @@ def aggregate_part_predictions(
     # the counterparty is or what the money was for. It may contribute Level 4
     # only; its Level 3, 5 and 6 are ignored.
     bank_only_flags = [is_bank_only_part(part_text) for part_text, _ in part_predictions]
+    # A part that is an exact Master Sheet match and names a counterparty type (Level 3)
+    # is read first, so no earlier part can outvote the Master row.
+    priority = sorted(
+        range(len(part_predictions)),
+        key=lambda i: not (part_predictions[i][1].get(EXACT_MASTER_KEY) and part_predictions[i][1].get("Level_3")),
+    )
+    part_predictions = [part_predictions[i] for i in priority]
+    bank_only_flags = [bank_only_flags[i] for i in priority]
     for (_, prediction), bank_only in zip(part_predictions, bank_only_flags):
         for level_index in range(8):
             level_name = f"Level_{level_index}"
@@ -1472,12 +1644,23 @@ def apply_raw_transaction_overrides(
         if result.get("Level_5") == "p2p transfer":
             result["Level_5"] = ""
 
+    if WALLET_TOPUP_RE.search(marker_text) and result.get("Level_3") != "institution":
+        result["Level_3"] = "merchant"
+        result["Level_5"] = WALLET_TOPUP_LEVEL5
+
+    # A platform whose app IS the counterparty (slice) keeps its name as Level 6 when the
+    # payee field gives it; Level 6 is cleared only for a name read from a bank code or handle.
+    payee_field = _normalize_compare(match.group(1) if match else first_part)
+    payee_platform = payee_field if payee_field in PAYEE_PLATFORM_LEVEL6 else ""
+    if payee_platform and result.get("Level_3") == "merchant" and not result.get("Level_6"):
+        result["Level_6"] = payee_platform
+
     fill_specific_level6(text, result, part_texts)
 
     return _apply_transaction_rules(
         result,
         default_p2p_purpose=not automated_debit,
-        confirmed_level6=extract_level6_entity(text),
+        confirmed_level6=extract_level6_entity(text) or payee_platform,
     )
 
 
@@ -1643,6 +1826,42 @@ CHEQUE_INSTRUMENT_RE = re.compile(
 )
 # A returned instrument: "REJECT:<cheque no>:<return reason>".
 CHEQUE_RETURN_RE = re.compile(r"^\s*REJECT:(\d{1,6}):", flags=re.IGNORECASE)
+
+
+# (pattern, Level 1) tried in order against the narration, only when Level 1 is blank.
+# An optional leading account / reference number ("50100047610192-TPT-...") is skipped.
+# Adding a bank's prefix is one row here; no code change.
+_LEAD = r"^(?:\d{6,}\s*[-/ ]\s*)?"
+LEVEL1_STRUCTURAL_RULES: tuple[tuple[re.Pattern, str], ...] = tuple(
+    (re.compile(pattern, re.IGNORECASE), value)
+    for pattern, value in (
+        (_LEAD + r"(?:POS|ME\s+DC\s+SI)\b", "card"),
+        (_LEAD + r"ACH\s*[DC]\s*-", "nach"),
+        (_LEAD + r"IB\s+BILLPAY\b", "bbps"),
+        (_LEAD + r"IB\b.*\bFUNDS\s+TRANSFER\b", "internal transfer"),
+        (_LEAD + r"TPT(?:\s|-|$)", "internal transfer"),
+    )
+)
+# A payment-gateway narration (PAYU...) gets the rail it spells out, only if exactly one.
+GATEWAY_NARRATION_RE = re.compile(r"(?<![a-z])payu", re.IGNORECASE)
+GATEWAY_RAIL_WORDS = ("upi", "imps", "neft", "rtgs")
+
+
+def apply_level1_structural_fill(particulars: str, result: dict[str, str]) -> dict[str, str]:
+    """Fill a blank Level 1 from structural prefixes. Never changes an existing value."""
+
+    if result.get("Level_1"):
+        return result
+    text = str(particulars or "").strip()
+    for pattern, value in LEVEL1_STRUCTURAL_RULES:
+        if pattern.search(text):
+            result["Level_1"] = value
+            return result
+    if GATEWAY_NARRATION_RE.search(text):
+        rails = [w for w in GATEWAY_RAIL_WORDS if re.search(rf"(?<![a-z]){w}(?![a-z])", text, re.IGNORECASE)]
+        if len(rails) == 1:
+            result["Level_1"] = rails[0]
+    return result
 
 
 def apply_cheque_instrument_override(particulars: str, result: dict[str, str]) -> dict[str, str]:
@@ -1956,6 +2175,10 @@ def apply_counterparty_purpose_compat(
     if result.get("Level_3") != "p2p":
         return result
     purpose = _normalize_compare(result.get("Level_5", ""))
+    # An institutional purpose (financial services, loan, insurance...) is never person-to-person.
+    if purpose in INSTITUTIONAL_LEVEL5:
+        result["Level_3"] = "institution"
+        return result
     if purpose not in MERCHANT_LEVEL5_PURPOSES:
         return result
 
@@ -1990,7 +2213,8 @@ def _is_non_salary_counterparty(row: pd.Series) -> bool:
     """
 
     text = str(row.get("Particulars", "") or "")
-    if str(row.get("Level_1", "") or "").strip().lower() == "cheque" or SALARY_CHEQUE_RAIL_RE.search(text):
+    # A cash deposit names no payer, so recurrence alone cannot make it salary.
+    if str(row.get("Level_1", "") or "").strip().lower() in {"cheque", "cash"} or SALARY_CHEQUE_RAIL_RE.search(text):
         return True
     if str(row.get("Level_3", "") or "").strip().lower() in {"merchant", "institution"}:
         return True
@@ -2046,7 +2270,7 @@ def apply_pre_detect_salary_overrides(df: pd.DataFrame) -> pd.DataFrame:
         # Rule 2: ACH credit + dividend
         if credit_num[idx] > 0 and ACH_CR_DIV_RE.search(text) and DIV_KEYWORD_RE.search(text):
             company = extract_level6_entity(text)
-            output_df.at[idx, "Level_1"] = "ach"
+            output_df.at[idx, "Level_1"] = "nach"
             output_df.at[idx, "Level_3"] = "institution"
             output_df.at[idx, "Level_5"] = "dividend"
             output_df.at[idx, "Level_6"] = company
@@ -2674,6 +2898,22 @@ class BankStatementClassifier:
 
         self.keyword_classifier = KeywordClassifier(models_dir=models_dir)
 
+    def _classify_parts(self, flat_parts: list[str]) -> list[dict[str, str]]:
+        """Classify the parts, marking the ones that are exact Master Sheet matches."""
+
+        if not flat_parts:
+            return []
+        with_metadata = getattr(self.keyword_classifier, "classify_batch_with_metadata", None)
+        if with_metadata is None:
+            return self.keyword_classifier.classify_batch(flat_parts)
+        predictions = []
+        for row in with_metadata(flat_parts):
+            prediction = {name: row.get(name, "") for name in _empty_levels()}
+            if row.get("decision_source") == "exact_lookup":
+                prediction[EXACT_MASTER_KEY] = True
+            predictions.append(prediction)
+        return predictions
+
     def classify(self, df: pd.DataFrame) -> pd.DataFrame:
         """Return a row-level classified dataframe."""
 
@@ -2694,7 +2934,7 @@ class BankStatementClassifier:
                     flat_parts.append(part_value)
                     part_positions.append((row_index, part_column))
 
-        predictions = self.keyword_classifier.classify_batch(flat_parts) if flat_parts else []
+        predictions = self._classify_parts(flat_parts)
 
         grouped_predictions: dict[int, list[tuple[str, dict[str, str]]]] = defaultdict(list)
         for (row_index, _), part_text, prediction in zip(part_positions, flat_parts, predictions):
@@ -2748,6 +2988,11 @@ class BankStatementClassifier:
                 output_df.loc[row_index, "Credit"],
                 row_prediction,
             )
+            row_prediction = apply_platform_purpose_guard(
+                str(output_df.loc[row_index, "Particulars"]),
+                row_prediction,
+                [part_text for part_text, _ in row_parts],
+            )
             row_prediction = apply_narration_purpose_override(
                 str(output_df.loc[row_index, "Particulars"]),
                 row_prediction,
@@ -2758,6 +3003,9 @@ class BankStatementClassifier:
             row_prediction = apply_cheque_instrument_override(
                 str(output_df.loc[row_index, "Particulars"]),
                 row_prediction,
+            )
+            row_prediction = apply_level1_structural_fill(
+                str(output_df.loc[row_index, "Particulars"]), row_prediction
             )
             row_prediction = apply_amount_direction_override(
                 output_df.loc[row_index, "Debit"],

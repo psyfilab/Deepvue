@@ -363,7 +363,6 @@ MANUAL_MERCHANT_HINTS: dict[str, dict[str, str]] = {
     },
     "amazonpay": {
         "Level_3": "merchant",
-        "Level_5": "digital services",
         "Level_6": "amazon pay",
     },
     "amazon": {"Level_3": "merchant", "Level_5": "retail", "Level_6": "amazon"},
@@ -381,37 +380,30 @@ MANUAL_MERCHANT_HINTS: dict[str, dict[str, str]] = {
     "paytmqr": {
         "Level_3": "institution",
         "Level_4": "paytm",
-        "Level_5": "digital services",
     },
     "googlepay": {
         "Level_3": "institution",
         "Level_4": "google pay",
-        "Level_5": "digital services",
     },
     "phonepe": {
         "Level_3": "institution",
         "Level_4": "phonepe",
-        "Level_5": "digital services",
     },
     "bharatpe": {
         "Level_3": "institution",
         "Level_4": "bharatpe",
-        "Level_5": "digital services",
     },
     "freecharge": {
         "Level_3": "institution",
         "Level_4": "freecharge",
-        "Level_5": "digital services",
     },
     "cashfree": {
         "Level_3": "institution",
         "Level_4": "cashfree",
-        "Level_5": "digital services",
     },
     "razorpay": {
         "Level_3": "institution",
         "Level_4": "razorpay",
-        "Level_5": "digital services",
     },
     "groww": {"Level_3": "merchant", "Level_5": "financial services", "Level_6": "groww"},
     "msrtc": {"Level_3": "merchant", "Level_5": "transport", "Level_6": "msrtc"},
@@ -422,6 +414,22 @@ MANUAL_MERCHANT_HINTS: dict[str, dict[str, str]] = {
     "cafecreme": {"Level_3": "merchant", "Level_5": "dining", "Level_6": "cafe creme"},
     "starbucks": {"Level_3": "merchant", "Level_5": "dining", "Level_6": "starbucks"},
 }
+
+# Real digital-service brands (subscriptions, app stores, SaaS). A payment platform or
+# gateway is never listed here: it is a rail, not a purpose. Add brands as data.
+# Multi-word entries match with or without spaces ("google play" / "googleplay").
+REAL_DIGITAL_BRANDS: tuple[str, ...] = (
+    "google play", "playstore", "play store", "netflix", "amazon prime", "prime video",
+    "youtube", "spotify", "hotstar", "disney", "apple services", "microsoft", "xsolla",
+    "hostinger", "zee5", "sonyliv",
+)
+
+
+def brand_alternation(brands) -> str:
+    """Regex alternation for brand names, tolerant of missing or extra spaces."""
+
+    return "|".join(r"\s*".join(re.escape(word) for word in b.split()) for b in sorted(brands, key=len, reverse=True))
+
 
 def _tok(*alternatives: str) -> str:
     """Regex for short words (5 letters or fewer) that must stand alone as a token.
@@ -498,7 +506,7 @@ PURPOSE_PATTERNS: list[tuple[re.Pattern[str], str]] = [
     ),
     (
         re.compile(
-            r"googlepay|phonepe|razorpay|cashfree|freecharge|bharatpe|" + _tok("paytm", "gpay", "payu"),
+            _tok(brand_alternation(REAL_DIGITAL_BRANDS)),
             re.IGNORECASE,
         ),
         "digital services",
