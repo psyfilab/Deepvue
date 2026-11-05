@@ -71,7 +71,14 @@ def write_output(
 
     try:
         with pd.ExcelWriter(tmp_path, engine="openpyxl") as writer:
-            split_df.to_excel(writer, sheet_name="Split", index=False)
+            # Copy First/Second Level Classification values from the fully-classified
+            # DataFrame into the Split sheet (the columns already exist there but are
+            # empty; classified_df shares the same row index as split_df).
+            split_display = split_df.copy()
+            for col in ("First Level Classification", "Second Level Classification"):
+                if col in classified_df.columns and col in split_display.columns:
+                    split_display[col] = classified_df[col].reindex(split_display.index)
+            split_display.to_excel(writer, sheet_name="Split", index=False)
             unique_df.to_excel(writer, sheet_name="Unique_Keywords", index=False)
             classified_df.to_excel(writer, sheet_name="Classified", index=False)
             salary_summary_df.to_excel(writer, sheet_name="Salary_Summary", index=False)

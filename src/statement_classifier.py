@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import bisect
 import logging
 import re
 from collections import defaultdict
+from typing import NamedTuple
 
 import pandas as pd
 
@@ -943,6 +945,123 @@ def _normalize_compare(value: str) -> str:
 
 # Channel words that may precede the rail ("INET-IMPS-CR-<ref>-<NAME>"): not an entity.
 HYPHEN_RAIL_CHANNEL_PREFIXES = ("INET",)
+# Rail prefixes that banks glue onto the rail name: word -> (Level 1, layout of the rest).
+# "slash" = PREFIX/<ref>/<name or IFSC>/<account>; "hyphen" = PREFIX-<NAME> <ref> UTR ...
+# Sure ones only; add a row here to teach a new bank layout (it also feeds the Level 6 stop list).
+LEVEL1_PREFIX_WORDS: dict[str, tuple[str, str]] = {
+    "impsar": ("imps", "slash"),
+    "impsab": ("imps", "slash"),
+    "upiab": ("upi", "slash"),
+    "rtgso": ("rtgs", "hyphen"),
+    "nefto": ("neft", "hyphen"),
+}
+_LEAD = r"^(?:\d{6,}\s*[-/ ]\s*)?"
+LEVEL1_STRUCTURAL_RULES: tuple[tuple[re.Pattern, str], ...] = tuple(
+    (re.compile(pattern, re.IGNORECASE), value)
+    for pattern, value in (
+        (_LEAD + r"(?:POS|ME\s+DC\s+SI)\b", "card"),
+        (_LEAD + r"ACH\s*[DC]\s*-", "nach"),
+        (_LEAD + r"IB\s+BILLPAY\b", "bbps"),
+        (_LEAD + r"IB\b.*\bFUNDS\s+TRANSFER\b", "internal transfer"),
+        (_LEAD + r"TPT(?:\s|-|$)", "internal transfer"),
+    )
+) + tuple(
+    # Rail prefixes from LEVEL1_PREFIX_WORDS (IMPSAR, UPIAB, RTGSO, NEFTO ...).
+    (re.compile(_LEAD + re.escape(word) + r"(?=[/\-\s:])", re.IGNORECASE), level_1)
+    for word, (level_1, _) in LEVEL1_PREFIX_WORDS.items()
+)
+# Channel / product prefixes that never name a payee, whether or not Level 1 is decided for them.
+CHANNEL_PREFIX_WORDS = frozenset(
+    {"mobft", "mobcc", "etxn", "imps", "neft", "rtgs", "upi", "nach", "atm", "trf"}
+)
+# Labels a bank prints instead of a payee: phrase -> (Level 3, Level 5, direction) it implies.
+# An empty Level 3 / Level 5 means the phrase is only a label (never a payee). Leading phrases
+# are stripped from a name ("trf to X" -> "x"); a value made only of them is not a payee.
+# direction "debit" = the implied labels apply to debits only (a credit is not a repayment).
+# Another bank's loan or charge phrase only needs a row here.
+LABEL_PHRASES: dict[str, tuple[str, str, str]] = {
+    "loan recovery for": ("institution", "loan repayment", "debit"),
+    "loan account payments for": ("institution", "loan repayment", "debit"),
+    "charges for": ("institution", "charges", "any"),
+    "general charges recovery": ("institution", "charges", "any"),
+    "general charges": ("institution", "charges", "any"),
+    "locker rent": ("institution", "charges", "any"),
+    "locker": ("institution", "charges", "any"),
+    "vetting fees": ("institution", "charges", "any"),
+    "credit card payment": ("", "", ""),
+    "self": ("", "", ""),
+    "trf to": ("", "", ""),
+    "trf frm": ("", "", ""),
+    "trf from": ("", "", ""),
+    "mobft from": ("", "", ""),
+    "mobft to": ("", "", ""),
+    "auto debit for": ("", "", ""),
+}
+
+
+def _rule_prefix_words(pattern: re.Pattern) -> set[str]:
+    """Prefix words a Level 1 structural rule is keyed on ("ACH\\s*[DC]\\s*-" gives ach)."""
+
+    source = pattern.pattern
+    if source.startswith(_LEAD):
+        source = source[len(_LEAD):]
+    group = re.match(r"\(\?:([^()]*)\)", source)
+    head = group.group(1) if group else re.split(r"\\b|\(\?|\\s\*\[|\[|-|\.|\$", source, maxsplit=1)[0]
+    return {w.lower() for w in re.findall(r"[A-Za-z]{2,}", head.replace("\\s", " "))}
+
+
+# Every prefix of every Level 1 structural rule is a stop word: no manual list to keep in step.
+LEVEL6_STOP_WORDS = frozenset(
+    {w for pattern, _ in LEVEL1_STRUCTURAL_RULES for w in _rule_prefix_words(pattern)}
+    | CHANNEL_PREFIX_WORDS
+    | {w for ph in LABEL_PHRASES for w in ph.split()}
+)
+# Prefix words stripped from the front of a name (statement-specific ones only; the standard
+# channel words stay in the stop list but are never cut out of a longer value).
+STRIP_PREFIX_WORDS = frozenset(LEVEL1_PREFIX_WORDS) | {"mobft", "mobcc", "etxn"}
+_LABEL_PHRASES_LONGEST_FIRST = tuple(
+    ph.split() for ph in sorted(LABEL_PHRASES, key=lambda x: -len(x.split())) if len(ph.split()) > 1
+)
+
+
+def strip_leading_labels(value: str) -> str:
+    """Drop leading label phrases and prefix words from a name: "trf to pma" -> "pma"."""
+
+    tokens = re.findall(r"[a-z0-9&.\-]+", str(value or "").lower())
+    changed = True
+    while changed and tokens:
+        changed = False
+        for phrase in _LABEL_PHRASES_LONGEST_FIRST:
+            if tokens[: len(phrase)] == phrase:
+                tokens = tokens[len(phrase):]
+                changed = True
+                break
+        else:
+            if len(tokens) > 1 and tokens[0] in STRIP_PREFIX_WORDS:
+                tokens = tokens[1:]
+                changed = True
+    return " ".join(tokens)
+
+
+def is_stop_value(value: str) -> bool:
+    """True when a Level 6 candidate is empty, or only rail words, labels and reference numbers."""
+
+    tokens = [t for t in re.findall(r"[a-z0-9]+", str(value or "").lower()) if not t.isdigit()]
+    return not tokens or all(t in LEVEL6_STOP_WORDS for t in tokens)
+
+
+def guard_level6(value: str, particulars: str = "") -> str:
+    """Return a clean payee, or "" when the candidate is a rail word, label or reference."""
+
+    candidate = strip_leading_labels(value)
+    if is_stop_value(candidate):
+        return ""
+    first = re.match(r"\s*([a-z0-9]+)", str(particulars or "").lower())
+    if first and candidate == first.group(1):
+        return ""
+    return candidate
+
+
 GENERIC_LEVEL6_WORDS = frozenset(
     {
         "to", "by", "from", "for", "via", "bill", "bills", "payment", "payments",
@@ -1006,6 +1125,8 @@ def is_generic_level6(value: str) -> bool:
     text = _normalize_compare(value)
     if len(re.sub(r"[^a-z]", "", text)) < 3:
         return True
+    if is_stop_value(text):
+        return True
     return all(token in GENERIC_LEVEL6_WORDS for token in re.findall(r"[a-z0-9]+", text))
 
 
@@ -1064,7 +1185,347 @@ def _clean_layout_name(value: str) -> str:
     return name
 
 
+# Layouts where the payee sits between a prefix and a reference: group 1 is the name.
+MOBFT_NAME_RE = re.compile(r"^\s*MOBFT\s+(?:from|to)\s*:\s*(.+?)\s*/\s*\d{6,}", flags=re.IGNORECASE)
+_HYPHEN_PREFIXES = [w for w, (_, layout) in LEVEL1_PREFIX_WORDS.items() if layout == "hyphen"]
+_SLASH_PREFIXES = [w for w, (_, layout) in LEVEL1_PREFIX_WORDS.items() if layout == "slash"]
+HYPHEN_PREFIX_NAME_RE = re.compile(
+    r"^\s*(?:" + "|".join(_HYPHEN_PREFIXES) + r")\s*-\s*(.+?)(?=\s+\S*\d{6,}|\s+UTR\b|$)", flags=re.IGNORECASE
+)
+SLASH_PREFIX_RE = re.compile(r"^\s*(?:" + "|".join(_SLASH_PREFIXES) + r")/(.*)$", flags=re.IGNORECASE)
+IFSC_LIKE_RE = re.compile(r"^[A-Z]{4}0[A-Z0-9]{6}$|^[A-Z]{4}\d{3,}[A-Z0-9]*$", flags=re.IGNORECASE)
+
+
+def _slash_prefix_name(rest: str) -> str:
+    """First segment of PREFIX/<ref>/<name or IFSC>/<account> that is a name, else ""."""
+
+    for segment in rest.split("/"):
+        seg = segment.strip()
+        if (
+            not seg
+            or re.fullmatch(r"[\d\s]+", seg)
+            or "@" in seg
+            or seg.upper() in {"CR", "DR"}
+            or IFSC_LIKE_RE.match(seg.replace(" ", ""))
+            or is_bank_only_part(seg)
+        ):
+            continue
+        return _clean_name_text(seg)
+    return ""
+
+
+# Words after which a name continues with a relative's name ("GAURAV S/O SH DINESH"): cut there.
+RELATIONSHIP_WORDS = frozenset({"so", "wo", "do", "wife", "son"})
+RELATIONSHIP_INITIALS = frozenset({"s", "w", "d"})
+
+
+def _trim_person_name(tokens: list[str]) -> list[str]:
+    """Cut a name at a relationship word (S/O, W/O, D/O, WIFE, SON) and drop single-letter tails."""
+
+    kept: list[str] = []
+    for index, token in enumerate(tokens):
+        if index >= 1 and (
+            token in RELATIONSHIP_WORDS
+            or (token in RELATIONSHIP_INITIALS and index + 1 < len(tokens) and tokens[index + 1] == "o")
+        ):
+            break
+        kept.append(token)
+    while len(kept) > 1 and len(kept[-1]) == 1:
+        kept.pop()
+    return kept
+
+
+def _clean_name_text(value: str) -> str:
+    text = re.sub(r"[^a-z0-9&.\- ]+", " ", str(value or "").lower())
+    tokens = [t for t in text.split() if not t.isdigit()]
+    return " ".join(_trim_person_name(tokens)).strip(" .-&")
+
+
+# ---------------------------------------------------------------------------
+# Level 6 (payee or brand name): layout-aware extraction and normalisation.
+#
+# Each rail writes the counterparty in one fixed field. LAYOUT_RULES names that
+# field per template, so the name is taken only from there. References, VPAs,
+# bank handles, IFSC codes, account numbers, cities, prefix words and bank names
+# are never candidates. A new bank layout needs one row in this table.
+# ---------------------------------------------------------------------------
+class LayoutRule(NamedTuple):
+    label: str
+    pattern: re.Pattern
+    has_name: bool = True  # False: the template carries no payee, Level 6 is blank
+    strip_words: tuple[str, ...] = ()  # leading words that belong to the template, not the name
+    city_group: str = ""  # group holding the city (never a candidate), for checks
+    bank_group: str = ""  # group holding the bank field (evidence, never a candidate)
+
+
+def _layout(
+    label: str, pattern: str, has_name: bool = True, strip: tuple[str, ...] = (), city: str = "", bank: str = ""
+) -> LayoutRule:
+    return LayoutRule(label, re.compile(pattern, flags=re.IGNORECASE), has_name, strip, city, bank)
+
+
+_HYPHEN_PREFIX_ALT = "|".join(_HYPHEN_PREFIXES) or r"(?!)"
+LAYOUT_RULES: tuple[LayoutRule, ...] = (
+    # --- templates that carry no payee -------------------------------------------------
+    _layout("atm_card", r"^\s*(?:NWD|ATW|ATM)\s*[-/ ]", has_name=False),
+    _layout("reversal_upi_ref", r"^\s*REV-UPI-\d", has_name=False),
+    _layout("billpay", r"^\s*IB\s+BILLPAY", has_name=False),
+    _layout("tax_line", r"^\s*\d{6}[A-Z]\d+\s+DPO\d+\s+[CSI]GST", has_name=False),
+    _layout("ach_return_charge", r"^\s*\.?ACH\s+DEBIT\s+RETURN", has_name=False),
+    _layout("upi_vpa_first", r"^\s*UPI\s*-\s*[^-]*@", has_name=False),
+    # --- name field named by the template ---------------------------------------------
+    # UPI-<NAME>-<VPA>@<handle>-<IFSC>-<ref>-<remark>
+    _layout("upi_hyphen", r"^\s*UPI\s*-\s*(?P<name>[^-@]+?)\s*-(?=.*@)"),
+    # IMPS-<ref>-<NAME>-<bank>-<account>-<remark>
+    _layout("imps_hyphen", r"^\s*IMPS\s*-\s*\d{6,}\s*-\s*(?P<name>[^-]+)"),
+    # NEFT CR-<IFSC>-<NAME>-<remitter>-<ref>
+    _layout("neft_cr", r"^\s*(?:NEFT|RTGS)\s+(?:CR|DR)\s*-\s*[A-Z]{4}0[A-Z0-9]{6}\s*-\s*(?P<name>[^-]+)"),
+    # RTGSO-<NAME> <ref> UTR ...   NEFTO-<NAME> <ref> ...
+    _layout("rail_out_hyphen", r"^\s*(?:" + _HYPHEN_PREFIX_ALT + r")\s*-\s*(?P<name>.+?)(?=\s+\S*\d{6,}|\s+UTR\b|$)"),
+    # ACH D- <NAME>-<mandate or reference>
+    _layout("ach_mandate", r"^\s*\.?ACH\s+[DC]\s*-\s*(?P<name>[^-]+)", strip=("tp ach", "tp")),
+    # <account>-TPT-<remark>-<NAME>
+    _layout("tpt", r"^\s*\d{6,}\s*-\s*TPT\s*-\s*[^-]*-\s*(?P<name>[^-]+)\s*$"),
+    # A2AINT01-<NAME>-<remark>-<period>
+    _layout("a2a", r"^\s*A2AINT\w*\s*-\s*(?P<name>[^-]+)"),
+    # POS/<MERCHANT>/<CITY>/<date>/<time>
+    _layout("pos_slash", r"^\s*POS/(?P<name>[^/]+)/(?P<city>[^/]*)/", city="city"),
+    # POS <masked card> <GATEWAY*>MERCHANT
+    _layout("pos_card", r"^\s*POS\s+\d{4,}X+\d{4}\s+(?:[A-Z]{2,5}\*)?(?P<name>.+?)\s*$"),
+    # MOBFT from or to: <NAME>/<ref>
+    _layout("mobft", r"^\s*MOBFT\s+(?:from|to)\s*:\s*(?P<name>.+?)\s*/\s*\d{6,}"),
+    # UPI|IMPS/P2A|P2M|P2P/<ref>/<NAME>/<bank>/...
+    _layout("slash_p2x", r"^\s*(?:UPI|IMPS)/(?:P2A|P2M|P2P)/\d{6,}/(?P<name>[^/]*)/(?P<bank>[^/]*)", bank="bank"),
+    # NEFT|RTGS/<ref>/<NAME>/<bank>/...
+    # (the IFSC field some banks put before the name is skipped)
+    _layout(
+        "slash_neft",
+        r"^\s*(?:NEFT|RTGS)/[A-Z0-9]*\d{5,}[A-Z0-9]*/(?:[A-Z]{4}0[A-Z0-9]{6}/)?(?P<name>[^/]*)(?:/(?P<bank>[^/]*))?",
+        bank="bank",
+    ),
+    # UPI/DR|CR/<ref>/<NAME>/<bank code>/<masked VPA>/...
+    _layout("upi_dr_slash", r"^\s*UPI/(?:DR|CR)/\d{6,}/(?P<name>[^/]*)/(?P<bank>[^/]*)", bank="bank"),
+)
+
+# Words a template adds in front of, or around, a name.
+TITLE_WORDS = frozenset({"mr", "mrs", "ms", "miss", "mister", "shri", "smt", "sh", "dr", "late"})
+# A generic label sitting in the name field ("Bank Acco", "Payment"): no payee.
+PLACEHOLDER_NAME_PHRASES = ("bank account", "payment", "upi payment", "upi", "transfer", "fund transfer", "paid via upi")
+# Words that complete a name split by line wrapping ("LIMIT ED", "PRI VATE", "SA LARY").
+WRAP_VOCABULARY = frozenset(
+    {
+        "limited", "private", "services", "service", "finance", "financial", "finlease", "fincap",
+        "enterprises", "enterprise", "industries", "solutions", "technologies", "trading", "traders",
+        "corporation", "company", "leasing", "capital", "commercial", "india", "salary", "payment",
+        "payments", "consultancy", "systems", "software", "infotech", "holdings", "securities",
+        "insurance", "credit", "loans", "stores", "agency", "associates", "foundation",
+    }
+)
+# Words that make a name a company, not a person (only a weak hint for Level 3).
+COMPANY_SUFFIX_WORDS = frozenset(
+    {"ltd", "limited", "pvt", "private", "llp", "inc", "finlease", "fincap", "finance", "financial",
+     "finserv", "leasing", "capital", "services", "enterprises", "industries", "solutions", "technologies"}
+)
+LEVEL6_TAIL_STOP = frozenset({"ltd", "limited", "pvt", "private"})
+
+
+def _letters(value: str) -> str:
+    return re.sub(r"[^a-z]", "", str(value or "").lower())
+
+
+def rejoin_wrapped_words(tokens: list[str], vocabulary: frozenset[str] | set[str] = frozenset()) -> list[str]:
+    """Join two neighbouring fragments when together they spell a known word.
+
+    "limit ed" -> "limited", "pri vate" -> "private". The join needs at least one
+    fragment that is not a word by itself, so "ram kumar" is never fused.
+    """
+
+    out: list[str] = []
+    index = 0
+    while index < len(tokens):
+        token = tokens[index]
+        if index + 1 < len(tokens):
+            nxt = tokens[index + 1]
+            joined = token + nxt
+            # Company words always rejoin. A word seen intact elsewhere in the statement
+            # rejoins when one fragment is not itself a word of the statement ("m ohd",
+            # "mar keting"); two intact words ("ram", "kumar") are never fused.
+            static_join = joined in WRAP_VOCABULARY and (token not in WRAP_VOCABULARY or nxt not in WRAP_VOCABULARY)
+            vocab_join = joined in vocabulary and (token not in vocabulary or nxt not in vocabulary)
+            if static_join or vocab_join:
+                out.append(joined)
+                index += 2
+                continue
+        out.append(token)
+        index += 1
+    return out
+
+
+def normalize_level6(value: str, strip_words: tuple[str, ...] = (), vocabulary: frozenset[str] | set[str] = frozenset()) -> str:
+    """Return a clean Level 6 name: lowercase, no punctuation, titles, relatives or reference tails.
+
+    "MR. RAJESH KUMAR S/O RAM" -> "rajesh kumar"; "M/S ABC TRADERS" -> "abc traders";
+    a token with a digit (a reference) ends the name; a single-letter tail is cut;
+    when nothing valid is left the result is "".
+    """
+
+    text = re.sub(r"[^a-z0-9 ]+", " ", str(value or "").lower().replace("'", ""))
+    tokens = text.split()
+    for phrase in strip_words:
+        words = phrase.split()
+        if len(tokens) > len(words) and tokens[: len(words)] == words:
+            tokens = tokens[len(words):]
+    # leading titles ("mr", "m s")
+    while tokens and (tokens[0] in TITLE_WORDS or (tokens[0] == "m" and len(tokens) > 1 and tokens[1] == "s")):
+        tokens = tokens[2:] if tokens[0] == "m" else tokens[1:]
+    # a reference (token with a digit) ends the name
+    kept: list[str] = []
+    for token in tokens:
+        if re.search(r"\d", token):
+            break
+        kept.append(token)
+    kept = _trim_person_name(rejoin_wrapped_words(kept, vocabulary))
+    # drop a trailing placeholder tail
+    while len(kept) > 1 and kept[-1] in {"o", "a"} and len(kept[-1]) == 1:
+        kept.pop()
+    name = " ".join(kept).strip()
+    if len(_letters(name)) < 3 or re.fullmatch(r"x+", _letters(name)):
+        return ""
+    return name
+
+
+def _is_placeholder_name(name: str) -> bool:
+    letters = _letters(name)
+    if len(letters) < 4:
+        return False
+    return any(_letters(phrase).startswith(letters) for phrase in PLACEHOLDER_NAME_PHRASES)
+
+
+def _is_bank_with_branch_tail(name: str) -> bool:
+    """A bank name followed only by "limited" or one short branch / centre code ("yes bank limited rac")."""
+
+    tokens = name.split()
+    for size in range(len(tokens) - 1, 1, -1):
+        head = " ".join(tokens[:size])
+        if match_bank_name(head) or head in BANK_ALIASES:
+            rest = [t for t in tokens[size:] if t not in COMPANY_SUFFIX_WORDS]
+            return len(rest) <= 1 and all(len(t) <= 4 for t in rest)
+    return False
+
+
+def _name_is_valid_payee(name: str) -> bool:
+    """False for stop values, labels, placeholders, bank names and charge words."""
+
+    if not name or is_stop_value(name) or _is_placeholder_name(name):
+        return False
+    if is_bank_only_part(name) or _is_bank_with_branch_tail(name):
+        return False
+    tokens = name.split()
+    return not all(t in GENERIC_LEVEL6_WORDS or t in LEVEL6_TAIL_STOP for t in tokens)
+
+
+def layout_level6_name(particulars: str) -> tuple[bool, str, str]:
+    """Return (matched, name, city) for the first LAYOUT_RULES template the narration fits.
+
+    ``matched`` is True when a template applies. ``name`` is "" when the template
+    has no payee or its name field holds only a label, bank name or reference.
+    """
+
+    text = str(particulars or "")
+    for rule in LAYOUT_RULES:
+        match = rule.pattern.match(text)
+        if not match:
+            continue
+        city = match.group(rule.city_group).strip() if rule.city_group else ""
+        if not rule.has_name:
+            return True, "", city
+        name = normalize_level6(match.group("name"), rule.strip_words)
+        return True, (name if _name_is_valid_payee(name) else ""), city
+    return False, "", ""
+
+
+VPA_LOCAL_RE = re.compile(r"([A-Za-z0-9._\-]+)\s*@")
+REFERENCE_NAME_RE = re.compile(r"^(?=[a-z0-9]*\d)(?=[a-z0-9]*[a-z])[a-z0-9]{6,}$|^\d{5,}$")
+
+
+def sanitize_level6(value: str, particulars: str = "") -> str:
+    """Blank a Level 6 that is a VPA, reference id, rail prefix, label, city or bank name."""
+
+    name = str(value or "").strip().lower()
+    if not name:
+        return ""
+    compact = re.sub(r"[^a-z0-9]", "", name)
+    if any(compact == re.sub(r"[^a-z0-9]", "", local.lower()) for local in VPA_LOCAL_RE.findall(str(particulars or ""))):
+        return ""
+    if any(REFERENCE_NAME_RE.match(token) for token in name.split()):
+        return ""
+    if not _name_is_valid_payee(name):
+        return ""
+    _, _, city = layout_level6_name(particulars)
+    if city and compact == re.sub(r"[^a-z0-9]", "", city.lower()):
+        return ""
+    return name
+
+
+def apply_layout_level6_override(
+    particulars: str,
+    result: dict[str, str],
+    master_locked: bool = False,
+) -> tuple[dict[str, str], bool]:
+    """Set Level 6 from the field the narration template names.
+
+    Returns the result and whether the layout name now sits in Level 6 (those
+    rows may be merged to one canonical name later). An exact Master match
+    keeps its Level 6; a fuller existing name that contains the layout name is
+    kept as well; otherwise the template's field replaces what the model took
+    from other text, and a template without a valid payee leaves it blank.
+    """
+
+    current = str(result.get("Level_6", "") or "")
+    if master_locked:
+        return result, False
+    matched, name, _ = layout_level6_name(particulars)
+    if not matched:
+        if current and result.get("Level_5") == "loan repayment" and is_bank_only_part(current):
+            return result, False  # a loan paid to a bank: the bank is the lender
+        cleaned = sanitize_level6(re.sub(r"\s+", " ", re.sub(r"[^a-z0-9 ]+", " ", current.lower())).strip(), particulars) if current else ""
+        if cleaned != current:
+            result["Level_6"] = cleaned
+        return result, False
+    if name and current and not is_generic_level6(current) and sanitize_level6(current, particulars):
+        # An existing name that is the same entity as the template's field (the same
+        # words ignoring "limited" / "pvt"), or that contains it ("swiggy genie" for
+        # "swiggy"), is a Master or brand spelling: it stays.
+        same_entity = (
+            entity_merge_score(current, name) >= 1.0
+            or _letters(name) in _letters(current)
+            or current in KNOWN_MERCHANT_FRAGMENTS  # a known brand inside a fuller template name
+        )
+        if same_entity and _letters(current) != _letters(name):
+            return result, False
+    if not name and current and result.get("Level_5") == "loan repayment" and is_bank_only_part(current):
+        return result, False  # a loan paid to a bank: the bank is the lender (IDFC FIRST BANK)
+    if (
+        not name
+        and current
+        and sanitize_level6(current, particulars)
+        and (
+            current in KNOWN_MERCHANT_FRAGMENTS
+            or (result.get("Level_3") == "merchant" and result.get("Level_5") not in {"", "p2p transfer"})
+        )
+    ):
+        return result, False  # the field holds only a bank, but the row has a known brand ("airtel", recharge)
+    result["Level_6"] = name
+    return result, bool(name)
+
+
 def extract_level6_entity(particulars: str) -> str:
+    """Return the counterparty named by the narration, for Level 6 (never a rail word or label)."""
+
+    return guard_level6(_extract_level6_entity_raw(particulars), particulars)
+
+
+def _extract_level6_entity_raw(particulars: str) -> str:
     """Return the counterparty named by the narration, for Level 6.
 
     Uses ``extract_narration_entity`` (slash rails, BBPS billers) first, then
@@ -1072,11 +1533,22 @@ def extract_level6_entity(particulars: str) -> str:
     the Level 7 counterparty key, which calls that function, is unchanged.
     """
 
+    matched, layout_name, _ = layout_level6_name(particulars)
+    if matched:
+        return layout_name
+
     entity = extract_narration_entity(particulars)
     if entity:
         return entity
 
     text = str(particulars or "")
+    for pattern in (MOBFT_NAME_RE, HYPHEN_PREFIX_NAME_RE):
+        named = pattern.match(text)
+        if named:
+            return _clean_name_text(named.group(1))
+    slash = SLASH_PREFIX_RE.match(text)
+    if slash:
+        return _slash_prefix_name(slash.group(1))
     for pattern in (
         INET_SLASH_ENTITY_RE,
         HYPHEN_RAIL_ENTITY_RE,
@@ -1122,6 +1594,10 @@ def fill_specific_level6(
     """
 
     current = result.get("Level_6", "")
+    stripped = strip_leading_labels(current) if current else current
+    had_label = bool(current) and stripped != _normalize_compare(current)
+    if stripped != current:
+        current = result["Level_6"] = stripped
     is_category = bool(current) and _normalize_compare(current) == _normalize_compare(result.get("Level_5", ""))
     biller = BBPS_BILLER_RE.search(str(particulars or ""))
     is_raw_biller_code = bool(biller) and re.sub(r"[^a-z0-9]", "", _normalize_compare(current)) == re.sub(
@@ -1131,7 +1607,8 @@ def fill_specific_level6(
     is_fragment_copy = (
         bool(entity)
         and _normalize_compare(current) != entity
-        and _echoes_narration_part(current, particulars, part_texts)
+        and not (current and entity_merge_score(current, entity) >= 1.0)  # same entity, Master spelling stays
+        and (had_label or _echoes_narration_part(current, particulars, part_texts))
     )
     if (
         current
@@ -1143,7 +1620,7 @@ def fill_specific_level6(
         return result
     if entity:
         result["Level_6"] = entity
-    elif is_category:
+    elif is_category or is_stop_value(current):
         result["Level_6"] = ""
     return result
 
@@ -1205,6 +1682,9 @@ def _apply_transaction_rules(
             or _normalize_compare(result["Level_6"]) == _normalize_compare(result["Level_5"])
         )
     ):
+        result["Level_6"] = ""
+
+    if result["Level_6"] and is_stop_value(result["Level_6"]):
         result["Level_6"] = ""
 
     if (
@@ -1785,6 +2265,126 @@ def apply_counterparty_type_override(
     return result
 
 
+# Narration-start patterns for the LABEL_PHRASES that imply a Level 3 / Level 5, longest first.
+LABEL_IMPLIED_RULES: tuple[tuple[re.Pattern, tuple[str, str, str]], ...] = tuple(
+    (re.compile(r"^\s*" + r"\s+".join(re.escape(w) for w in phrase.split()) + r"(?![a-z])", re.IGNORECASE), implied)
+    for phrase, implied in sorted(LABEL_PHRASES.items(), key=lambda item: -len(item[0]))
+    if implied[0] or implied[1]
+)
+# A business name hint: legal words, proprietor tags and common business stems.
+BUSINESS_NAME_STEM_RE = re.compile(
+    r"\b(?:prop|proprietor|\w*infra\w*|\w*beverage\w*|\w*industr\w*|\w*enterpri\w*|\w*traders?"
+    r"|\w*stores?|\w*collect\w*)\b",
+    flags=re.IGNORECASE,
+)
+
+
+def _name_has_business_evidence(name: str) -> bool:
+    """A business word, a business stem or a purpose pattern on the name itself."""
+
+    return bool(
+        BUSINESS_WORD_RE.search(name)
+        or BUSINESS_NAME_STEM_RE.search(name)
+        or _has_long_business_word(name)
+        or _matched_purposes(PLATFORM_NAME_RE.sub(" ", name), NAME_EVIDENCE_EXCLUDED_PURPOSES)
+    )
+
+
+def apply_label_layout_override(
+    particulars: str,
+    result: dict[str, str],
+    debit_value: object = None,
+    credit_value: object = None,
+    master_locked: bool = False,
+) -> dict[str, str]:
+    """Settle rows whose layout alone decides the counterparty type.
+
+    - LABEL_PHRASES that imply labels (Loan Recovery For, Charges for, Locker, Vetting
+      Fees ...): the Level 3 / Level 5 in the table, Level 6 blank.
+    - MOBFT from|to: <PERSON NAME>/<ref>: p2p / p2p transfer. A business-looking
+      name, or one the row already settled as merchant or institution, is left alone.
+    ``master_locked`` is True when an exact Master Sheet match set Level 3: nothing here
+    changes it.
+    """
+
+    if master_locked:
+        return result
+    text = str(particulars or "")
+    direction = derive_direction_from_amounts(debit_value, credit_value)
+    for pattern, (level_3, level_5, directions) in LABEL_IMPLIED_RULES:
+        if pattern.match(text):
+            if directions == "debit" and direction == "credit":
+                return result
+            result.update({"Level_3": level_3, "Level_5": level_5, "Level_6": ""})
+            return result
+    named = MOBFT_NAME_RE.match(text)
+    if named and result.get("Level_3") in {"", "p2p"} and not _name_has_business_evidence(named.group(1)):
+        result["Level_3"] = "p2p"
+        result["Level_5"] = "p2p transfer"
+    return result
+
+
+def _compact_key(text: str) -> str:
+    return re.sub(r"[^a-z0-9]", "", str(text or "").lower())
+
+
+def _drop_tail_exact_matches(
+    particulars: str, row_parts: list[tuple[str, dict[str, str]]]
+) -> list[tuple[str, dict[str, str]]]:
+    """In a "<RAILPREFIX>-<NAME> <ref> UTR ... Beneficiary Bank/Branch ..." row the payee is the
+    text right after the rail word. An exact Master match on a part that does not contain the
+    payee (a branch or city fragment such as "NEW DELHI") describes the tail, not the
+    counterparty, so it loses its exact-match priority."""
+
+    named = HYPHEN_PREFIX_NAME_RE.match(str(particulars or ""))
+    if not named:
+        return row_parts
+    payee = _compact_key(_clean_name_text(named.group(1)))
+    if not payee:
+        return row_parts
+    return [
+        (text, {k: v for k, v in prediction.items() if k != EXACT_MASTER_KEY})
+        if prediction.get(EXACT_MASTER_KEY) and payee not in _compact_key(text)
+        else (text, prediction)
+        for text, prediction in row_parts
+    ]
+
+
+def apply_rail_payee_override(
+    particulars: str,
+    result: dict[str, str],
+    master_locked: bool = False,
+) -> dict[str, str]:
+    """Counterparty type for "<RAILPREFIX>-<NAME> <ref> UTR ..." rows (RTGSO-, NEFTO- ...).
+
+    A merchant needs evidence in the name (business word / stem, or a purpose pattern).
+    Without it the payee is a person: Level 3 p2p, Level 5 p2p transfer, never retail.
+    With it, Level 3 is merchant and Level 5 is kept only when a purpose pattern on the
+    name supports it, otherwise blank. Institutions and exact Master matches are left alone.
+    """
+
+    if master_locked:
+        return result
+    named = HYPHEN_PREFIX_NAME_RE.match(str(particulars or ""))
+    if not named or result.get("Level_3") == "institution" or result.get("Level_5") == "salary":
+        return result
+    name = named.group(1)
+    # The payee is the text right after the rail word; bank, branch, IFSC and account
+    # text further on never names the counterparty.
+    payee = guard_level6(_clean_name_text(name), particulars)
+    if payee:
+        result["Level_6"] = payee
+    if _name_has_business_evidence(name):
+        supported = _matched_purposes(PLATFORM_NAME_RE.sub(" ", name), NAME_EVIDENCE_EXCLUDED_PURPOSES)
+        result["Level_3"] = "merchant"
+        if result.get("Level_5") not in supported:
+            result["Level_5"] = _most_specific_purpose(supported)
+    else:
+        result["Level_3"] = "p2p"
+        result["Level_5"] = "p2p transfer"
+    return result
+
+
 def apply_initiation_mode_override(
     particulars: str,
     result: dict[str, str],
@@ -1831,17 +2431,6 @@ CHEQUE_RETURN_RE = re.compile(r"^\s*REJECT:(\d{1,6}):", flags=re.IGNORECASE)
 # (pattern, Level 1) tried in order against the narration, only when Level 1 is blank.
 # An optional leading account / reference number ("50100047610192-TPT-...") is skipped.
 # Adding a bank's prefix is one row here; no code change.
-_LEAD = r"^(?:\d{6,}\s*[-/ ]\s*)?"
-LEVEL1_STRUCTURAL_RULES: tuple[tuple[re.Pattern, str], ...] = tuple(
-    (re.compile(pattern, re.IGNORECASE), value)
-    for pattern, value in (
-        (_LEAD + r"(?:POS|ME\s+DC\s+SI)\b", "card"),
-        (_LEAD + r"ACH\s*[DC]\s*-", "nach"),
-        (_LEAD + r"IB\s+BILLPAY\b", "bbps"),
-        (_LEAD + r"IB\b.*\bFUNDS\s+TRANSFER\b", "internal transfer"),
-        (_LEAD + r"TPT(?:\s|-|$)", "internal transfer"),
-    )
-)
 # A payment-gateway narration (PAYU...) gets the rail it spells out, only if exactly one.
 GATEWAY_NARRATION_RE = re.compile(r"(?<![a-z])payu", re.IGNORECASE)
 GATEWAY_RAIL_WORDS = ("upi", "imps", "neft", "rtgs")
@@ -1919,6 +2508,265 @@ def apply_amount_direction_override(
     return result
 
 
+# ---------------------------------------------------------------------------
+# One entity, one name: statement-level canonical Level 6 and Level 3 per entity.
+# ---------------------------------------------------------------------------
+ENTITY_MERGE_THRESHOLD = 0.8
+ENTITY_PREFIX_MIN_LETTERS = 6
+# Legal-form words and titles: ignored when two names are compared, never part of the identity.
+LEGAL_FORM_WORDS = frozenset({"ltd", "limited", "pvt", "private", "llp", "inc"})
+_NAME_NOISE_WORDS = LEGAL_FORM_WORDS | TITLE_WORDS
+IFSC_EVIDENCE_RE = re.compile(r"\b([A-Z]{4})\s?(0[A-Z0-9]{6})\b")
+VPA_HANDLE_RE = re.compile(r"@\s*([A-Za-z][A-Za-z ]{1,24})")
+BUSINESS_HANDLE_RE = re.compile(r"@\s*ok\s*biz", flags=re.IGNORECASE)
+LOAN_PHRASE_RE = re.compile(r"\bloan\s+(?:disburse\w*|repay\w*|closure|emi|interest)|\bemi\b", flags=re.IGNORECASE)
+P2M_TAG_RE = re.compile(r"/P2M/", flags=re.IGNORECASE)
+P2A_TAG_RE = re.compile(r"/P2A/", flags=re.IGNORECASE)
+ACH_RAIL_RE = re.compile(r"^\s*\.?ACH\s+[DC]\s*-", flags=re.IGNORECASE)
+# Structural evidence for Level 3, strongest first (Master matches rank above all of these).
+STRUCTURAL_L3_ORDER = ("p2m_tag", "p2a_tag", "ach_rail", "business_handle", "loan_phrase")
+STRUCTURAL_L3_VALUE = {
+    "p2m_tag": "merchant",
+    "p2a_tag": "p2p",
+    "ach_rail": "institution",
+    "business_handle": "merchant",
+    "loan_phrase": "institution",
+}
+
+
+def _name_tokens(name: str) -> list[str]:
+    tokens = [t for t in str(name or "").split() if t not in _NAME_NOISE_WORDS]
+    return tokens or str(name or "").split()
+
+
+def entity_merge_score(first: str, second: str) -> float:
+    """How surely two Level 6 names are one entity: 1.0 equal token sets; prefix scores by length ratio."""
+
+    a, b = _name_tokens(first), _name_tokens(second)
+    if not a or not b:
+        return 0.0
+    if frozenset(a) == frozenset(b):
+        return 1.0
+    la, lb = "".join(a), "".join(b)
+    short, long_ = (la, lb) if len(la) <= len(lb) else (lb, la)
+    if len(short) >= ENTITY_PREFIX_MIN_LETTERS and long_.startswith(short):
+        return 0.6 + 0.4 * len(short) / len(long_)
+    return 0.0
+
+
+def _row_evidence(row: pd.Series) -> dict[str, str]:
+    """Bank, IFSC and VPA handle of a row: facts that tell two same-looking names apart."""
+
+    text = str(row.get("Particulars", "") or "")
+    evidence: dict[str, str] = {}
+    bank = ""
+    for rule in LAYOUT_RULES:
+        found = rule.pattern.match(text) if rule.bank_group else None
+        if found:
+            bank = _letters(found.group(rule.bank_group))  # the template's own bank field
+            break
+    if len(bank) < 4:
+        level4 = str(row.get("Level_4", "") or "").strip().lower()
+        bank = _letters(level4) if level4 and not _is_platform_label(level4) else ""
+    if bank:
+        evidence["bank"] = bank
+    ifsc = IFSC_EVIDENCE_RE.search(text.upper())
+    if ifsc:
+        evidence["ifsc"] = ifsc.group(1) + ifsc.group(2)
+    handle = VPA_HANDLE_RE.search(text)
+    if handle:
+        evidence["vpa"] = re.sub(r"[^a-z]", "", handle.group(1).lower())
+    return evidence
+
+
+def _bank_values_agree(left: set[str], right: set[str]) -> bool:
+    """Bank fields are cut at different widths ("bankofi", "bankofindia"): a shared prefix is agreement."""
+
+    return any(a.startswith(b) or b.startswith(a) for a in left for b in right)
+
+
+def _evidence_conflict(left: dict[str, set[str]], right: dict[str, set[str]]) -> bool:
+    for kind in ("bank", "ifsc", "vpa"):
+        if not (left.get(kind) and right.get(kind)):
+            continue
+        agree = _bank_values_agree(left[kind], right[kind]) if kind == "bank" else bool(left[kind] & right[kind])
+        if not agree:
+            return True
+    return False
+
+
+def _statement_vocabulary(names: list[str]) -> set[str]:
+    counts: dict[str, int] = defaultdict(int)
+    for name in names:
+        for token in set(name.split()):
+            counts[token] += 1
+    return {token for token, count in counts.items() if count >= 2 and len(token) >= 4}
+
+
+def _entity_clusters(df: pd.DataFrame, rows: list) -> list[list]:
+    """Group rows into entities: merge compatible names that no evidence contradicts."""
+
+    nodes: dict[tuple[str, str], dict] = {}
+    for idx in rows:
+        row = df.loc[idx]
+        name = str(row.get("Level_6", "") or "")
+        if not name:
+            continue
+        evidence = _row_evidence(row)
+        node = nodes.setdefault((name, evidence.get("bank", "")), {"name": name, "rows": [], "ev": defaultdict(set)})
+        node["rows"].append(idx)
+        for kind, value in evidence.items():
+            node["ev"][kind].add(value)
+    items = list(nodes.values())
+    parent = list(range(len(items)))
+
+    def find(i: int) -> int:
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
+
+    cluster_ev = [{k: set(v) for k, v in item["ev"].items()} for item in items]
+    # Candidate pairs without an all-pairs scan: equal token sets share a key; a prefix
+    # pair sits next to each other in the sorted letter strings.
+    candidates: set[tuple[int, int]] = set()
+    by_tokens: dict[frozenset, list[int]] = defaultdict(list)
+    spelled: list[tuple[str, int]] = []
+    for i, item in enumerate(items):
+        tokens = _name_tokens(item["name"])
+        by_tokens[frozenset(tokens)].append(i)
+        spelled.append(("".join(tokens), i))
+    for members in by_tokens.values():
+        candidates.update((a, b) for pos, a in enumerate(members) for b in members[pos + 1 :])
+    spelled.sort()
+    keys = [letters for letters, _ in spelled]
+    for pos, (letters, i) in enumerate(spelled):
+        if len(letters) < ENTITY_PREFIX_MIN_LETTERS:
+            continue
+        end = bisect.bisect_left(keys, letters + "\uffff", pos + 1)
+        for _, j in spelled[pos + 1 : end]:
+            candidates.add((min(i, j), max(i, j)))
+    pairs = []
+    for i, j in candidates:
+        score = entity_merge_score(items[i]["name"], items[j]["name"])
+        if score >= ENTITY_MERGE_THRESHOLD:
+            pairs.append((score, i, j))
+    for _, i, j in sorted(pairs, key=lambda p: (-p[0], p[1], p[2])):
+        ri, rj = find(i), find(j)
+        if ri == rj or _evidence_conflict(cluster_ev[ri], cluster_ev[rj]):
+            continue
+        parent[rj] = ri
+        for kind, values in cluster_ev[rj].items():
+            cluster_ev[ri].setdefault(kind, set()).update(values)
+    groups: dict[int, list] = defaultdict(list)
+    for i, item in enumerate(items):
+        groups[find(i)].extend(item["rows"])
+    return list(groups.values())
+
+
+def apply_canonical_level6(df: pd.DataFrame, named_rows: set | None = None) -> pd.DataFrame:
+    """Give every row of one entity the same Level 6: the longest full name seen.
+
+    Only rows whose Level 6 came from a layout name field (``named_rows``) take
+    part; Master names are never touched. Two names merge when their token sets
+    are equal, or one is a prefix of the other (6 letters or more), the merge
+    score reaches ``ENTITY_MERGE_THRESHOLD`` and no bank, IFSC or VPA evidence
+    differs. Split words are rejoined from the statement's own vocabulary
+    ("m ohd" -> "mohd" when "mohd" appears intact elsewhere).
+    """
+
+    output_df = df.copy()
+    rows = [idx for idx in output_df.index if (named_rows is None or idx in named_rows) and str(output_df.at[idx, "Level_6"] or "")]
+    if not rows:
+        return output_df
+    vocabulary = _statement_vocabulary([str(output_df.at[idx, "Level_6"]) for idx in rows])
+    for idx in rows:
+        name = str(output_df.at[idx, "Level_6"])
+        rejoined = " ".join(rejoin_wrapped_words(name.split(), vocabulary))
+        if rejoined != name:
+            output_df.at[idx, "Level_6"] = rejoined
+    for cluster in _entity_clusters(output_df, rows):
+        names = {str(output_df.at[idx, "Level_6"]) for idx in cluster}
+        if len(names) < 2:
+            continue
+        counts = {n: sum(str(output_df.at[idx, "Level_6"]) == n for idx in cluster) for n in names}
+        display = max(names, key=lambda n: (len(_letters(n)), counts[n], len(n.split()), n))
+        for idx in cluster:
+            output_df.at[idx, "Level_6"] = display
+    return output_df
+
+
+def _structural_l3_tag(text: str, level1: str, name: str) -> str:
+    if P2M_TAG_RE.search(text):
+        return "p2m_tag"
+    if P2A_TAG_RE.search(text):
+        # An account-to-account transfer says nothing about a business-named account.
+        company = bool(set(name.split()) & COMPANY_SUFFIX_WORDS) or _name_has_business_evidence(name)
+        return "" if company else "p2a_tag"
+    if ACH_RAIL_RE.match(text) or level1 == "nach":
+        return "ach_rail"
+    if BUSINESS_HANDLE_RE.search(text):
+        return "business_handle"
+    if LOAN_PHRASE_RE.search(text) and (set(name.split()) & COMPANY_SUFFIX_WORDS or _name_has_business_evidence(name)):
+        return "loan_phrase"
+    return ""
+
+
+def apply_entity_level3(
+    df: pd.DataFrame,
+    named_rows: set | None = None,
+    locked_rows: set | None = None,
+) -> pd.DataFrame:
+    """Make Level 3 agree across the rows of one entity, evidence first.
+
+    Order: a Master match, then structural evidence (P2M / P2A tag, ACH rail,
+    business VPA handle, loan phrase), then a company suffix, which is only a
+    weak hint: it may choose between values the entity already has but never
+    replaces a value every row agrees on. When nothing decides, rows keep their
+    value. Master-matched rows are never changed.
+    """
+
+    output_df = df.copy()
+    locked = locked_rows or set()
+    rows = [idx for idx in output_df.index if (named_rows is None or idx in named_rows) and str(output_df.at[idx, "Level_6"] or "")]
+    for cluster in _entity_clusters(output_df, rows):
+        name = str(output_df.at[cluster[0], "Level_6"])
+        master = [str(output_df.at[i, "Level_3"] or "") for i in cluster if i in locked and output_df.at[i, "Level_3"]]
+        tags = {}
+        for i in cluster:
+            if i in locked:
+                continue
+            tag = _structural_l3_tag(
+                str(output_df.at[i, "Particulars"] or ""), str(output_df.at[i, "Level_1"] or "").lower(), str(output_df.at[i, "Level_6"])
+            )
+            if tag:
+                tags[tag] = tags.get(tag, 0) + 1
+        existing = [str(output_df.at[i, "Level_3"] or "") for i in cluster if i not in locked and output_df.at[i, "Level_3"]]
+        value = ""
+        if master:
+            value = max(set(master), key=master.count)
+        elif tags:
+            value = STRUCTURAL_L3_VALUE[next(tag for tag in STRUCTURAL_L3_ORDER if tag in tags)]
+        elif existing and set(existing) != {"p2p"} and "p2p" in existing:
+            company = any(set(str(output_df.at[i, "Level_6"]).split()) & COMPANY_SUFFIX_WORDS for i in cluster)
+            if company:
+                others = [v for v in existing if v != "p2p"]
+                value = max(set(others), key=others.count)
+        elif existing and len(set(existing)) == 1 and len(existing) < len(cluster):
+            value = existing[0]  # fill the blanks of a cluster whose rows all agree
+        if not value:
+            continue
+        for i in cluster:
+            if i in locked or str(output_df.at[i, "Level_5"] or "") == "salary" or str(output_df.at[i, "Level_1"] or "") == "cash":
+                continue
+            if str(output_df.at[i, "Level_3"] or "") == value:
+                continue
+            output_df.at[i, "Level_3"] = value
+            if value in {"merchant", "institution"} and str(output_df.at[i, "Level_5"] or "") == "p2p transfer":
+                output_df.at[i, "Level_5"] = ""
+    return output_df
+
+
 def extract_salary_entity(text: str) -> str:
     """Extract a likely salary source string from particulars."""
 
@@ -1960,58 +2808,118 @@ def clean_salary_entity(value: str) -> str:
             continue
         kept.append(token)
         prev_filler = prev_salary_word = False
-    return " ".join(kept)
+    name = " ".join(kept)
+    return "" if is_stop_value(name) else name
+
+
+class FirstLevelRule(NamedTuple):
+    """One First Level rule: a narration pattern and the label for each direction ("" = no label)."""
+
+    name: str
+    pattern: re.Pattern
+    debit: str
+    credit: str
+
+
+def _wrap_safe(*words: str) -> str:
+    """Alternation of words that tolerates a line-wrap space inside a word ("ASSURA NCE")."""
+
+    return "|".join(r"\s?".join(re.escape(ch) for ch in word) for word in words)
+
+
+def _fl(name: str, pattern: str, debit: str, credit: str = "") -> FirstLevelRule:
+    return FirstLevelRule(name, re.compile(pattern, flags=re.IGNORECASE), debit, credit)
+
+
+# First Level Classification is compared with the reference statement analysis, so the label set
+# follows it: "<rail> Payment" / "<rail> Receipt" plus purpose labels. The first rule whose pattern
+# matches and that has a label for the row's direction wins. Order is the priority: specific
+# purposes first, then the payment rail. A new bank prefix or keyword needs one row here.
+FIRST_LEVEL_RULES: tuple[FirstLevelRule, ...] = (
+    # --- returns, reversals, charges, interest ---------------------------------------
+    _fl("cheque_return", r"^\s*REJECT\b", "Outward Cheque Return"),
+    _fl("investment", r"ZERODHA|DHANI\s+STOCKS|MARGADARSI|\bCHITS?\b|^\s*IB\s+FD\b|FD\s+PREMAT|SUPERMON|MUTUAL\s+FUND|\bSIP\b|BROKING|\bDEMAT\b|GROWW|UPSTOX", "Investment", "Investment"),
+    _fl("bank_charges", r"^\s*(?:RTN|RETURN)\s+CHG|\bECS\b.*\bSC\b|^(?!\s*(?:(?:TO|BY)\s+[^-]*-\s*)?UPI).*(?:\bCHR?GS?\b|\bCHARGES?\b|\bSMS\s+ALERT|\bPENAL|\bFEES?\b)", "Bank Charges"),
+    _fl("interest", r"\bINT\.?\s*(?:PD|COLL)\b|:INT\.|\bINTE?RE?ST\b|\bINTREST\b|\bSBINT\b|\bINT\s+ON\b|\bINT:", "Interest Paid", "Interest Received"),
+    _fl("online_return_in", r"^\s*UPIRET|^\s*REV-UPI|RTGS\s+RETURN|\bRETURN\b.*\b(?:RTGS|NEFT|UPI)\b", "", "Inward Online Return"),
+    _fl("refund", r"REFUND|REVERSING|REVERSAL|^\s*REV\b|^\s*CRV\b|SUBSIDY|^\s*APBS\b", "", "Refund/Reversal"),
+    _fl("online_return_out", r"^(?!\s*(?:IMPS|NEFT|RTGS))(?!.*LOAN).*(?:\bRETURN(?:ED)?\b|\bREFUND)", "Outward Online Return"),
+    _fl("salary", r"\bSA\s?LARY\b", "Salary", "Salary"),
+    _fl("bill_statement", r"^\s*TO\s+BILL\s+PAYMENT", "Bill Payment"),
+    _fl("credit_card", r"CRED\s?CLUB|CRED\.CLUB|CREDIT[\s_]?CARD|MOBCC|^\s*CC\s+\d|BILLDK\w*CARDS|\bAUTOPAY\b.*\bSI\b", "Credit Card Payment"),
+    _fl("insurance", _wrap_safe("INSURANCE", "ASSURANCE", "PREMIUM") + r"|\bLIC\b|PMSBY|PMJJBY|HDFCERGO|GODIGIT|SUNLIFE", "Insurance", "Insurance"),
+    _fl("rent", r"\bRENT\b|RENTL\b", "Rent Payment"),
+    _fl("tax", r"^\s*GIB/.*(?:GST|TAX)|\bITDTAX|\bTAX\b", "Tax", "Tax"),
+    _fl("forex", r"^\s*INW\b|\bUSD\d|\bFOREX\b", "Forex/Remittances", "Forex/Remittances"),
+    # --- mandates and loans -----------------------------------------------------------
+    _fl("ach", r"^\s*\.?ACH\s*[DC]\b|\bNACH\b|\bECS\b|^\s*CMS/|\bEMIS?\b", "ECS/NACH Payment", "ECS/NACH Receipt"),
+    # A loan word on a UPI line is a remark to a person ("UPI Payment"); on other rails it is a loan.
+    _fl("loan_on_bank_rail", r"^(?!\s*(?:(?:TO|BY)\s+[^-]*-\s*)?UPI)(?:.*(?:LOAN|" + _wrap_safe("REPAYMENT") + r"))", "Loan", "Loan"),
+    _fl("loan_account", r"\bLOAN\s+ACC", "Loan", "Loan"),
+    _fl("rtgs_in_transfer", r"INFT/.*\bRTGS\b", "RTGS Payment", "RTGS Receipt"),
+    _fl("neft_in_transfer", r"INFT/.*\bNEFT\b", "NEFT Payment", "NEFT Receipt"),
+    # --- utilities (telecom, fuel, bill payments) --------------------------------------
+    _fl("utility", r"^(?!\s*(?:IMPS|NEFT|RTGS))(?:.*)(?:AIRTEL(?!\s*PAYMENTS)|PETROL|FILLING\s?ST|FUEL(?!\s*ST)|FREECHARGE|" + _wrap_safe("POSTPAID", "ELECTRICITY", "RECHARGE", "BROADBAND") + r"|TATA\s?(?:PLAY|SKY)|\bBSNL\b|VODAFONE|\bIOCL\b|\bBPCL\b|\bHPCL\b)", "Utility Expenses", "Utility Expenses"),
+    # --- cash, card, wallet ------------------------------------------------------------
+    _fl("cash_return", r"^\s*CASH-REVERSAL", "", "Cash Return"),
+    _fl("atm_statement", r"^\s*TO\s+ATM\b", "ATM Withdrawal"),
+    _fl("cash_out", r"^\s*(?:ATM|ATW|NWD|EAW|CWDR|SELF)\b|\bCASH\s+WITHDRAWAL", "Cash Withdrawal"),
+    _fl("cash_in", r"^\s*(?:CASH|CAM)\b|\bCASH\s+DEP|^\s*BY\s+CASH", "", "Cash Deposit"),
+    _fl("pos", r"^\s*(?:POS|ECOM\s+PUR)\b", "POS Expense"),
+    _fl("wallet", r"^\s*DRP/|^\s*MCRM\d", "Other Payment", "Other Receipt"),
+    _fl("me_debit", r"^\s*ME\s+DC\b", "Other Payment"),
+    # --- payment rail ------------------------------------------------------------------
+    _fl("upi", r"^\s*(?:(?:TO|BY)\s+[^-]*-\s*)?UPI(?:AB)?\b", "UPI Payment", "UPI Receipt"),
+    _fl("imps", r"^\s*(?:(?:TO|BY)\s+[^-]*-\s*)?(?:IMPS|IMPSAR|IMPSAB|MMT/IMPS|(?:INET|MOB)-\s*IMPS)\b", "IMPS Payment", "IMPS Receipt"),
+    _fl("neft", r"^\s*(?:(?:TO|BY)\s+[^-]*-\s*)?(?:NEFT|NEFTO|(?:INET|MOB)-\s*NEFT)\b", "NEFT Payment", "NEFT Receipt"),
+    _fl("rtgs", r"^\s*(?:(?:TO|BY)\s+[^-]*-\s*)?(?:RTGS|RTGSO)\b", "RTGS Payment", "RTGS Receipt"),
+    _fl("cheque_clearing", r"^\s*CLG\b|CLEARING\s*/\s*CHEQUE|^\s*(?:TRFR?|ME)\b", "Cheque Payment", ""),
+    _fl("cheque_credit", r"^\s*CLG\b|CLEARING\s*/\s*CHEQUE", "", "Cheque Receipt"),
+    _fl("mobile_banking", r"^\s*(?:MB|MOB)\b", "Mobile Payment", "Mobile Receipt"),
+    _fl("mobft", r"^\s*MOBFT\b", "Online Payment", "Mobile Receipt"),
+    _fl("online_transfer", r"^\s*(?:INF|IFT|INB|BIL|IB|TRFR?|NET|FT)\b|-TPT-|/PAYU\w*$|^\s*REF-|BILLDK|/RAZP[A-Z]|\bINW\b", "Online Payment", "Online Receipt"),
+    # A narration that is only a name (no rail, no digits): a cheque or transfer entry.
+    _fl("name_only", r"^[A-Za-z][A-Za-z.&,\s]*[A-Za-z]$", "Cheque Payment", "Online Receipt"),
+)
+
+# Rail label from Level 1 when no narration rule applies.
+FIRST_LEVEL_BY_LEVEL1: dict[str, tuple[str, str]] = {
+    "upi": ("UPI Payment", "UPI Receipt"),
+    "imps": ("IMPS Payment", "IMPS Receipt"),
+    "neft": ("NEFT Payment", "NEFT Receipt"),
+    "rtgs": ("RTGS Payment", "RTGS Receipt"),
+    "cheque": ("Cheque Payment", "Cheque Receipt"),
+    "nach": ("ECS/NACH Payment", "ECS/NACH Receipt"),
+    "ach": ("ECS/NACH Payment", "ECS/NACH Receipt"),
+    "auto-debit": ("ECS/NACH Payment", "ECS/NACH Receipt"),
+    "cash": ("Cash Withdrawal", "Cash Deposit"),
+    "card": ("POS Expense", ""),
+    "wallet": ("Other Payment", "Other Receipt"),
+    "internal transfer": ("Online Payment", "Online Receipt"),
+    "bbps": ("Bill Payment", ""),
+}
 
 
 def derive_first_level_classification(row: pd.Series) -> str:
-    """Map row-level predictions into a coarse business transaction label."""
+    """Return the First Level label: purpose keywords, then the rail, with Payment / Receipt by direction."""
 
     debit_num = parse_amount(row.get("Debit"))
     credit_num = parse_amount(row.get("Credit"))
     level_1 = str(row.get("Level_1", "") or "").strip().lower()
-    level_2 = str(row.get("Level_2", "") or "").strip().lower()
     level_5 = str(row.get("Level_5", "") or "").strip().lower()
     particulars = str(row.get("Particulars", "") or "")
     is_debit = debit_num > 0 and credit_num <= 0
+    is_credit = credit_num > 0 and not is_debit
 
-    if level_5 == "salary" and not is_debit:
-        return "Salary"
-    if SALARY_KEYWORDS.search(particulars) and credit_num > 0:
-        return "Salary"
-    if level_1 == "upi" and credit_num > 0:
-        return "UPI Receipt"
-    if level_1 == "upi":
-        return "UPI Payment"
-    if level_1 == "neft":
-        return "NEFT Payment"
-    if level_1 == "rtgs":
-        return "RTGS Payment"
-    if level_1 == "imps":
-        return "IMPS Payment"
-    if level_1 == "cheque":
-        return "Cheque Payment"
-    if level_1 == "cash" and debit_num > 0:
-        return "Cash Withdrawal"
-    if level_1 == "cash" and credit_num > 0:
-        return "Cash Deposit"
-    # Level_2 holds "System generated" / "User-generated", never "auto-debit": a
-    # system-generated row whose narration is a mandate debit is the ECS/NACH row.
-    if level_2 in {"auto-debit", "system generated"} and is_debit and MANDATE_DEBIT_RE.search(particulars):
-        return "ECS/NACH Payment"
+    for rule in FIRST_LEVEL_RULES:
+        label = rule.debit if is_debit else rule.credit if is_credit else ""
+        if label and rule.pattern.search(particulars):
+            return label
+    label = FIRST_LEVEL_BY_LEVEL1.get(level_1, ("", ""))[0 if is_debit else 1] if (is_debit or is_credit) else ""
+    if label:
+        return label
     if level_5 == "loan repayment":
         return "Loan"
-    if level_5 == "credit card":
-        return "Credit Card Payment"
-    if level_5 in {"utilities", "mobile recharge", "bill payment"}:
-        return "Utility Expenses"
-    if level_5 == "insurance":
-        return "Insurance"
-    if level_5 == "tax":
-        return "Tax"
-    if level_5 in {"investment", "financial services"}:
-        return "Investment"
-    if "refund" in particulars.lower() or level_5 == "refund":
-        return "Refund/Reversal"
     return derive_first_level_fallback(particulars, level_1, level_5)
 
 
@@ -2027,7 +2935,7 @@ FIRST_LEVEL_FALLBACKS: list[tuple[re.Pattern[str], str]] = [
     (re.compile(r"\bInt\.\s*(?:Coll|Pd)\b|\bINTEREST\s+(?:PAID|CREDITED|COLLECTED)\b", re.IGNORECASE), "Interest"),
     # Dividends: "DR REDDYS DIV 23 ...", "ACH C- HCL 1ST INTDIV24 ...", and codes
     # run together with the company name ("TCSFINDIV...", "TCS3INTSPLDIV...").
-    (re.compile(r"\bDIV(?:IDEND)?S?\d*\b|(?:INT|FIN|SPL)DIV", re.IGNORECASE), "Dividend"),
+    (re.compile(r"\bDIV(?:IDEND)?S?\d*\b|(?:INT|FIN|SPL)DIV", re.IGNORECASE), "Other Receipt"),
     # Card payments: "POS 416021XXXXXX3640 ...", "ME DC SI ...", "ECOM PUR/..."
     (re.compile(r"^\s*(?:POS|ME\s+DC\s+SI|ECOM\s+PUR)\b", re.IGNORECASE), "Card Payment"),
     # International remittances: ".../INTL/DR/.../INTL TRANSFER-"
@@ -2066,7 +2974,79 @@ def derive_second_level_classification(row: pd.Series) -> str:
         return level_5.title()
     if level_3 == "p2p":
         return "P2P"
-    return level_3.title() if level_3 else ""
+    if level_3:
+        return level_3.title()
+    # Nothing known about purpose or counterparty: describe the transaction type instead.
+    return SECOND_LEVEL_BY_FIRST.get(str(row.get("First Level Classification", "") or "").strip(), "")
+
+
+# Second Level when Level 5 and Level 3 are blank: the kind of transaction the First Level names.
+SECOND_LEVEL_BY_FIRST: dict[str, str] = {
+    "Cash Withdrawal": "Cash", "ATM Withdrawal": "Cash", "Cash Deposit": "Cash", "Cash Return": "Cash",
+    "ECS/NACH Payment": "Mandate", "ECS/NACH Receipt": "Mandate", "Contra": "Mandate Reversal",
+    "Bank Charges": "Charges", "Interest Paid": "Interest", "Interest Received": "Interest",
+    "Salary": "Salary", "Investment": "Investment", "Tax": "Tax", "Insurance": "Insurance",
+    "Loan": "Loan Repayment", "Credit Card Payment": "Credit Card", "Utility Expenses": "Utilities",
+    "Bill Payment": "Utilities", "POS Expense": "Card Purchase", "Refund/Reversal": "Refund",
+    "Inward Online Return": "Refund", "Outward Online Return": "Refund", "Outward Cheque Return": "Cheque Return",
+    "Rent Payment": "Rent", "Other Receipt": "Wallet", "Other Payment": "Wallet",
+    "RTGS Payment": "Bank Transfer", "RTGS Receipt": "Bank Transfer", "NEFT Payment": "Bank Transfer",
+    "NEFT Receipt": "Bank Transfer", "IMPS Payment": "Bank Transfer", "IMPS Receipt": "Bank Transfer",
+    "Online Payment": "Bank Transfer", "Online Receipt": "Bank Transfer", "Mobile Payment": "Bank Transfer",
+    "Mobile Receipt": "Bank Transfer", "Cheque Payment": "Cheque", "Cheque Receipt": "Cheque",
+    "UPI Payment": "UPI", "UPI Receipt": "UPI", "Forex/Remittances": "Remittance",
+}
+
+
+CONTRA_WINDOW_DAYS = 7
+
+
+def apply_first_level_contra(df: pd.DataFrame) -> pd.DataFrame:
+    """Label a mandate debit and its same-amount reversal credit "Contra".
+
+    A debit and a credit with the same narration and amount, within
+    ``CONTRA_WINDOW_DAYS`` of each other, cancel out: both rows are Contra.
+    Only mandate (ECS/NACH) rows are paired.
+    """
+
+    output_df = df.copy()
+    labels = output_df["First Level Classification"].astype(str)
+    candidates = output_df.index[labels.isin({"ECS/NACH Payment", "ECS/NACH Receipt"})]
+    if len(candidates) < 2:
+        return output_df
+    debit = output_df.loc[candidates, "Debit"].map(parse_amount)
+    credit = output_df.loc[candidates, "Credit"].map(parse_amount)
+    dates = None
+    if "Date" in output_df.columns:
+        raw_dates = output_df.loc[candidates, "Date"]
+        try:
+            iso_dates = pd.to_datetime(raw_dates, errors="coerce", format="ISO8601")
+        except (ValueError, TypeError):
+            iso_dates = pd.Series(pd.NaT, index=raw_dates.index)
+        dates = iso_dates
+        if iso_dates.isna().any():
+            dates = iso_dates.fillna(pd.to_datetime(raw_dates, errors="coerce", dayfirst=True))
+    groups: dict[tuple[str, float], dict[str, list]] = defaultdict(lambda: {"d": [], "c": []})
+    for idx in candidates:
+        amount = debit[idx] if debit[idx] > 0 and credit[idx] <= 0 else credit[idx]
+        if amount <= 0:
+            continue
+        side = "d" if debit[idx] > 0 and credit[idx] <= 0 else "c"
+        key = (" ".join(str(output_df.at[idx, "Particulars"]).split()).lower(), round(float(amount), 2))
+        groups[key][side].append(idx)
+    for sides in groups.values():
+        pool = list(sides["c"])
+        for d_idx in sides["d"]:
+            for c_idx in pool:
+                near = True
+                if dates is not None and pd.notna(dates[d_idx]) and pd.notna(dates[c_idx]):
+                    near = abs((dates[d_idx] - dates[c_idx]).days) <= CONTRA_WINDOW_DAYS
+                if near:
+                    output_df.at[d_idx, "First Level Classification"] = "Contra"
+                    output_df.at[c_idx, "First Level Classification"] = "Contra"
+                    pool.remove(c_idx)
+                    break
+    return output_df
 
 
 # ---------------------------------------------------------------------------
@@ -2446,7 +3426,12 @@ def detect_salary(df: pd.DataFrame) -> pd.DataFrame:
     output_df.loc[salary_mask, "Level_5"] = "salary"
     output_df.loc[salary_mask, "Level_7"] = ""
     output_df.loc[salary_mask, "Level_6"] = salary_entity.loc[salary_mask]
-    output_df.loc[salary_mask, "First Level Classification"] = "Salary"
+    # First Level says "Salary" only when the narration itself says so; a recurring credit that
+    # is salary by Level 5 keeps its rail label ("RTGS Receipt").
+    if salary_mask.any():
+        output_df.loc[salary_mask, "First Level Classification"] = output_df.loc[salary_mask].apply(
+            derive_first_level_classification, axis=1
+        )
     output_df.loc[salary_mask, "Second Level Classification"] = ""
 
     return output_df
@@ -2941,8 +3926,12 @@ class BankStatementClassifier:
             grouped_predictions[row_index].append((part_text, prediction))
 
         row_level_predictions = []
+        named_rows: set = set()
+        locked_rows: set = set()
         for row_index in output_df.index:
-            row_parts = grouped_predictions.get(row_index, [])
+            row_parts = _drop_tail_exact_matches(
+                str(output_df.loc[row_index, "Particulars"]), grouped_predictions.get(row_index, [])
+            )
             row_prediction = aggregate_part_predictions(row_parts)
             row_prediction = apply_structured_upi_overrides(
                 row_parts,
@@ -2975,6 +3964,20 @@ class BankStatementClassifier:
                 output_df.loc[row_index, "Debit"],
                 output_df.loc[row_index, "Credit"],
                 [part_text for part_text, _ in row_parts],
+            )
+            master_locked = any(
+                prediction.get(EXACT_MASTER_KEY) and prediction.get("Level_3")
+                for _, prediction in row_parts
+            )
+            row_prediction = apply_label_layout_override(
+                str(output_df.loc[row_index, "Particulars"]),
+                row_prediction,
+                output_df.loc[row_index, "Debit"],
+                output_df.loc[row_index, "Credit"],
+                master_locked,
+            )
+            row_prediction = apply_rail_payee_override(
+                str(output_df.loc[row_index, "Particulars"]), row_prediction, master_locked
             )
             row_prediction = apply_initiation_mode_override(
                 str(output_df.loc[row_index, "Particulars"]),
@@ -3019,6 +4022,13 @@ class BankStatementClassifier:
                 output_df.loc[row_index, "Credit"],
                 [part_text for part_text, _ in row_parts],
             )
+            row_prediction, layout_named = apply_layout_level6_override(
+                str(output_df.loc[row_index, "Particulars"]), row_prediction, master_locked
+            )
+            if layout_named:
+                named_rows.add(row_index)
+            if master_locked:
+                locked_rows.add(row_index)
             row_level_predictions.append(row_prediction)
 
         merchant_rows = sum(
@@ -3046,10 +4056,13 @@ class BankStatementClassifier:
         levels_df = pd.DataFrame(row_level_predictions, index=output_df.index)
         output_df = pd.concat([output_df, levels_df], axis=1)
         output_df = apply_cheque_return_level1(output_df)
+        output_df = apply_canonical_level6(output_df, named_rows)
+        output_df = apply_entity_level3(output_df, named_rows, locked_rows)
         output_df["First Level Classification"] = output_df.apply(
             derive_first_level_classification,
             axis=1,
         )
+        output_df = apply_first_level_contra(output_df)
         output_df["Second Level Classification"] = output_df.apply(
             derive_second_level_classification,
             axis=1,
