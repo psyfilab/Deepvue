@@ -13,11 +13,13 @@ import pandas as pd
 
 if __package__ in {None, ""}:
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+    from src.format_workbook import format_workbook
     from src.microsegment import Microsegmenter
     from src.salary_timeseries import build_salary_time_series, save_salary_timeline_plots
     from src.statement_classifier import BankStatementClassifier, build_salary_summary
     from src.statement_splitter import load_statement, split_statement
 else:
+    from .format_workbook import format_workbook
     from .microsegment import Microsegmenter
     from .salary_timeseries import build_salary_time_series, save_salary_timeline_plots
     from .statement_classifier import BankStatementClassifier, build_salary_summary
@@ -178,6 +180,8 @@ def main() -> int:
         salary_window_summary_df,
         salary_window_txn_df,
     )
+    if output_path.suffix.lower() != ".csv":
+        format_workbook(output_path, classified_df=enriched_df)  # final presentation step only
     plots_dir = output_path.with_name(f"{output_path.stem}_plots")
     plot_paths = save_salary_timeline_plots(
         enriched_df,

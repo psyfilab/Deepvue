@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import logging
 import re
+from collections import defaultdict
 from pathlib import Path
+from typing import NamedTuple
 
 # pyrefly: ignore[missing-import]
 import matplotlib
@@ -51,6 +53,312 @@ def _parse_dates(series: pd.Series) -> pd.Series:
     """
 
     return pd.to_datetime(series.map(_level7_parse_date), errors="coerce")
+
+
+# ---------------------------------------------------------------------------------------------
+# Narration reading shared with microsegment.py: payee name, noise stripping, whole-word matching.
+# ---------------------------------------------------------------------------------------------
+# Where the payee name sits for each narration layout (first match wins). The UPI handle, bank code,
+# reference and purpose tail that follow the name are never part of the payee.
+PAYEE_LAYOUTS = tuple(
+    re.compile(pattern, re.IGNORECASE)
+    for pattern in (
+        r"^(?:TO|BY) TRANSFER-\s*UPI/(?:DR|CR|P2A|P2M)/\d+/(?P<name>[^/]+)/",
+        r"^UPI/(?:DR|CR|P2A|P2M)/\d+/(?P<name>[^/]+)(?:/|$)",
+        r"^UPI-(?P<name>[^-]+)-",
+        r"^IMPS-\d+-(?P<name>[^-]+)-",
+        r"^(?:(?:BY|TO) )?(?:NEFT-|TRANSFER-)?\s*NEFT/(?:CR|DR)/[^/]+/(?P<name>[^/]+)/",
+        r"^(?:(?:BY|TO) )?NEFT(?: CR| DR)?-[A-Z0-9]{6,}-(?P<name>[^-]+)(?:-|$)",
+        r"^RTGS(?: CR| DR)?-[A-Z0-9]{6,}-(?P<name>[^-]+)(?:-|$)",
+        r"^RTGS:[A-Z0-9]+/[^/]+/(?P<name>.+)$",
+        r"^ACH [DC]-\s*(?P<name>[^-]+)-",
+        r"^(?:MOBFT|TRFR) FROM:\s*(?P<name>[^/]+)",
+        r"^INF/INFT/\d+/(?P<name>.+)$",
+        r"^(?:POS|ECOM)\s+\S+\s+(?P<name>.+)$",
+        r"^\d{6,}-TPT-(?P<name>.+)$",
+    )
+)
+BANK_NAME_RE = re.compile(
+    r"\b(?:indian overseas|state bank(?: of [a-z]+)?|bank of [a-z]+|[a-z]+ bank(?: ltd| limited)?|"
+    r"hdfc|icici|sbi|kotak|idfc|pnb|canara|bandhan|indusind|rbl|iob|boi)\b",
+    re.IGNORECASE,
+)
+_VPA_RE = re.compile(r"\S+@\S+")
+_IFSC_RE = re.compile(r"\b[A-Za-z]{4}0[A-Za-z0-9]{6}\b")
+_WRAPPED_IFSC_RE = re.compile(r"\b[A-Za-z]{2,4}\s?[A-Za-z]{0,2}\s?RL\s?\d{5,}\b|\bFD\s*RL\d+\b", re.IGNORECASE)
+_LONG_DIGITS_RE = re.compile(r"\b\w*\d{4,}\w*\b")
+_MASKED_RE = re.compile(r"\b\w*x{3,}\w*\b", re.IGNORECASE)
+_PURPOSE_TAIL_RE = re.compile(r"/\s*([A-Za-z]{2,8})\s*-\s*$")
+_NON_ALNUM_RE = re.compile(r"[^a-z0-9]+")
+
+
+def _squash(text: object) -> str:
+    return _NON_ALNUM_RE.sub(" ", str(text or "").lower()).strip()
+
+
+def word_variants(text: object) -> str:
+    """Lower-case words with spaces on both sides, plus joins of a wrapped word ("bigbaske t" -> "bigbasket").
+
+    Matching ` word ` against this string is whole-word matching.
+    """
+
+    tokens = _squash(text).split()
+    joined = [a + b for a, b in zip(tokens, tokens[1:]) if min(len(a), len(b)) <= 2]
+    return " " + " ".join(tokens + joined) + " "
+
+
+def strip_noise(text: object) -> str:
+    """Remove UPI handles, IFSC codes, masked and numeric references and bank names."""
+
+    value = str(text or "")
+    for pattern in (_VPA_RE, _WRAPPED_IFSC_RE, _IFSC_RE, _MASKED_RE, _LONG_DIGITS_RE, BANK_NAME_RE):
+        value = pattern.sub(" ", value)
+    return re.sub(r"\s+", " ", value).strip()
+
+
+class PayeeInfo(NamedTuple):
+    name: str  # payee as written in the layout slot ("" when the layout has none)
+    text: str  # what keyword rules may read: payee (or the cleaned narration when no layout) + Level 6
+    is_bank: bool  # the payee slot holds a bank name
+
+
+def payee_info(particulars: object, level_6: object = "") -> PayeeInfo:
+    """Payee name part of a narration, without handle, bank, reference or purpose tail."""
+
+    narration = str(particulars or "").strip()
+    name = None
+    for layout in PAYEE_LAYOUTS:
+        match = layout.search(narration)
+        if match:
+            name = match.group("name").strip()
+            break
+    if name is not None:
+        is_bank = bool(BANK_NAME_RE.search(name))
+        base = strip_noise(name)
+    else:
+        is_bank = False
+        base = strip_noise(narration)
+    extra = strip_noise(level_6) if not is_bank else ""
+    return PayeeInfo(name or "", f"{base} {extra}".strip(), is_bank)
+
+
+def purpose_tail(particulars: object) -> str:
+    """The purpose tag a UPI narration ends with ("Groc", "Trvl", "Wall"...), lower case, or ''."""
+
+    match = _PURPOSE_TAIL_RE.search(str(particulars or "").strip())
+    return match.group(1).lower() if match else ""
+
+
+def purpose_text(particulars: object) -> str:
+    """The last wording segment of a narration ("... -HAND LOAN" -> "HAND LOAN")."""
+
+    for part in reversed(re.split(r"[-/]", str(particulars or ""))):
+        if re.search(r"[A-Za-z]{2}", part) and not _LONG_DIGITS_RE.fullmatch(part.strip()):
+            return part.strip()
+    return ""
+
+
+# ---------------------------------------------------------------------------------------------
+# Salary rules (table driven). refine_salary() runs before micro-segmentation so that Salary Flag,
+# Level 5 and Microsegmentation always agree.
+# ---------------------------------------------------------------------------------------------
+SALARY_WORDS = re.compile(r" (?:salary|salaries|payroll|payslip|wages) ")
+SALARY_MIN_INFERRED = 10_000  # inferred (repeating payer) salary credits below this are not salary
+SALARY_MAX_WITHOUT_WORD = 500_000  # larger credits are salary only when the narration says SALARY
+SALARY_AMOUNT_TOLERANCE = 0.10
+SALARY_MIN_MONTHS = 3
+SALARY_DAY_STD_MAX = 7
+SALARY_CONFIDENCE_EXPLICIT = 1.0
+SALARY_CONFIDENCE_REPEATING = 0.8
+SALARY_CONFIDENCE_FLOOR = 0.6  # below this a row is not salary
+NEVER_SALARY_RE = re.compile(
+    r"\bIB\s*FD\s*PREMAT|\bFD\s*(?:PREMAT|MATUR|CLOS|REDEMPTION)|\bTPT\b|\bOWN\s*ACC|\bINTERNAL\b|\bSELF\b|"
+    r"\bREFUND|\bREVERS|\bCASHBACK|\bRETURN|\bREJECT|^\s*DRP/|^\s*CLG/|\bCHQ\b|\bCHEQUE\b|\bCLEARING\b",
+    re.IGNORECASE,
+)
+NEVER_SALARY_LEVEL_5 = frozenset({
+    "interest", "dividend", "charges", "wallet load", "wallet unload", "refund", "cashback", "loan disbursement",
+})
+# Payers that move money for others (wallets, gateways, payment banks) are never an employer.
+PAYMENT_PLATFORM_PAYER_WORDS = (
+    "paytm", "one97", "phonepe", "razorpay", "payu", "cashfree", "billdesk", "mobikwik", "freecharge",
+    "bharatpe", "juspay", "gpay", "google pay", "amazon pay", "wallet", "payments", "payment", "pay",
+)
+FIRST_LEVEL_NEVER_ON_DEBIT = frozenset({"salary"})
+SALARY_WORD_MASK_RE = re.compile(r"\b(?:SA\s?LARY|SALARIES|PAYROLL|PAYSLIP|WAGES)\b", re.IGNORECASE)
+COMPANY_WORDS = re.compile(r" (?:pvt|private|ltd|limited|llp|india|services|technologies) ")
+PAYER_KEY_LENGTH = 8  # statements truncate names at different lengths; compare the first characters
+PAYER_TITLE_RE = re.compile(r"^(?:mr|mrs|ms|miss|shri|smt|sri|dr|m s)(?=[a-z ])", re.IGNORECASE)
+SALARY_MIN_ONE_PER_MONTH = 0.8  # share of months in which the payer paid exactly once (salary comes monthly)
+SALARY_MAX_REPEATING_PAYERS = 3  # more repeating payers than this is a business / receipts-heavy account
+
+
+def _level(row: pd.Series, name: str) -> str:
+    return str(row.get(name, "") or "").strip().lower()
+
+
+def _payer_key(info: PayeeInfo) -> str:
+    name = PAYER_TITLE_RE.sub("", (info.name or info.text).strip().lower()).strip()
+    return re.sub(r"[^a-z0-9]", "", name)[:PAYER_KEY_LENGTH]
+
+
+def infer_account_holder(df: pd.DataFrame) -> str:
+    """The account holder's name, read from the beneficiary slot of NEFT credit narrations.
+
+    "NEFT CR-IFSC-PAYER-BENEFICIARY-REF": the beneficiary is the same person on every row.
+    Returns a compact lower-case key, or '' when the statement has no such rows.
+    """
+
+    counts: dict[str, int] = defaultdict(int)
+    for text in df["Particulars"].astype(str):
+        parts = text.split("-")
+        if len(parts) >= 5 and re.match(r"\s*NEFT CR\s*$", parts[0], re.IGNORECASE):
+            key = re.sub(r"[^a-z0-9]", "", parts[3].lower())
+            if len(key) >= 6:
+                counts[key] += 1
+    repeated = [(count, key) for key, count in counts.items() if count >= 2]
+    return max(repeated)[1] if repeated else ""
+
+
+def _is_account_holder(payer_compact: str, holder: str) -> bool:
+    if not holder or len(payer_compact) < 6:
+        return False
+    return payer_compact.startswith(holder) or holder.startswith(payer_compact)
+
+
+def _rederive_levels(frame: pd.DataFrame, mask: pd.Series, *, blank_second_level: pd.Series) -> None:
+    """Recompute First / Second Level for the masked rows with the classifier's own derivations."""
+
+    if not mask.any():
+        return
+    try:
+        from . import statement_classifier as classifier
+
+        first_level = classifier.derive_first_level_classification
+        second_level = classifier.derive_second_level_classification
+    except (ImportError, AttributeError):
+        return
+    rows = frame.loc[mask]
+    frame.loc[mask, "First Level Classification"] = rows.apply(first_level, axis=1)
+    rows = frame.loc[mask]
+    frame.loc[mask, "Second Level Classification"] = rows.apply(second_level, axis=1)
+    frame.loc[blank_second_level, "Second Level Classification"] = ""
+
+
+def refine_salary(df: pd.DataFrame) -> pd.DataFrame:
+    """Recompute IsSalary / SalaryConfidence and bring Level 3, 5 and First / Second Level in line.
+
+    A credit is salary when the narration has an explicit salary word (1.0) or the same payer sends a
+    similar amount in at least SALARY_MIN_MONTHS different months on a steady day of month (0.8).
+    A debit is never salary. Rows that are not salary lose any salary label.
+    """
+
+    out = df.copy()
+    for column, default in (("IsSalary", 0), ("SalaryConfidence", 0.0), ("Level_3", ""), ("Level_5", ""),
+                            ("Level_6", ""), ("Level_2", ""), ("First Level Classification", ""),
+                            ("Second Level Classification", "")):
+        if column not in out.columns:
+            out[column] = default
+    credit = out["Credit"].apply(parse_amount)
+    debit = out["Debit"].apply(parse_amount) if "Debit" in out.columns else pd.Series(0.0, index=out.index)
+    credit_only = credit > 0  # a debit is never salary
+    particulars = out["Particulars"].fillna("").astype(str)
+    level_6 = out["Level_6"].fillna("").astype(str)
+    infos = [payee_info(text, l6) for text, l6 in zip(particulars, level_6)]
+    keys = pd.Series([_payer_key(info) for info in infos], index=out.index)
+    level_5 = out["Level_5"].fillna("").astype(str).str.strip().str.lower()
+
+    holder = infer_account_holder(out)
+    never = pd.Series(
+        [bool(NEVER_SALARY_RE.search(text)) or level in NEVER_SALARY_LEVEL_5
+         or _is_account_holder(re.sub(r"[^a-z0-9]", "", (info.name or "").lower()), holder)
+         for text, level, info in zip(particulars, level_5, infos)],
+        index=out.index,
+    )
+    platform_re = re.compile(r" (?:" + "|".join(re.escape(w) for w in PAYMENT_PLATFORM_PAYER_WORDS) + r") ")
+    never |= pd.Series([bool(platform_re.search(word_variants(info.name or info.text))) for info in infos],
+                       index=out.index)
+    has_word = pd.Series([bool(SALARY_WORDS.search(word_variants(text))) for text in particulars], index=out.index)
+
+    salary = pd.Series(False, index=out.index)
+    confidence = pd.Series(0.0, index=out.index)
+    explicit = credit_only & has_word  # an explicit salary word on a credit is always salary
+    salary[explicit] = True
+    confidence[explicit] = SALARY_CONFIDENCE_EXPLICIT
+
+    # Repeating payer: same payer, amounts within the tolerance, enough different months, steady day.
+    debit_keys = {key for key, amount in zip(keys, debit) if amount > 0 and key}
+    dates = _parse_dates(out["Date"]) if "Date" in out.columns else pd.Series(pd.NaT, index=out.index)
+    candidates = out.index[
+        credit_only & ~has_word & ~never & dates.notna()
+        & (credit >= SALARY_MIN_INFERRED) & (credit <= SALARY_MAX_WITHOUT_WORD)
+        & keys.ne("") & ~keys.isin(debit_keys)
+    ]
+    by_payer: dict[str, list[int]] = defaultdict(list)
+    for index in candidates:
+        by_payer[keys[index]].append(index)
+    accepted: list[list[int]] = []
+    for indices in by_payer.values():
+        cluster: list[int] = []
+        for index in sorted(indices, key=lambda i: credit[i]):
+            if cluster and credit[index] > credit[cluster[0]] * (1 + SALARY_AMOUNT_TOLERANCE):
+                if _is_salary_cluster(cluster, dates):
+                    accepted.append(cluster)
+                cluster = []
+            cluster.append(index)
+        if _is_salary_cluster(cluster, dates):
+            accepted.append(cluster)
+    if len(accepted) <= SALARY_MAX_REPEATING_PAYERS:  # many repeating payers = business account, not a payroll
+        for cluster in accepted:
+            salary.loc[cluster] = True
+            confidence.loc[cluster] = SALARY_CONFIDENCE_REPEATING
+
+    # Level 3 / Level 5 / First & Second Level follow the decision.
+    previous_label = level_5.eq("salary") | out["First Level Classification"].astype(str).str.lower().eq("salary")
+    out["IsSalary"] = salary.astype(int)
+    out["SalaryConfidence"] = confidence.where(salary, 0.0)
+    cleared = previous_label & ~salary
+    out.loc[level_5.eq("salary") & ~salary, "Level_5"] = ""
+    became = salary & ~level_5.eq("salary")
+    if "Level_0" in out.columns:
+        out.loc[became, "Level_0"] = "credit"
+    out.loc[salary, "Level_5"] = "salary"
+    blank_entity = salary & out["Level_6"].fillna("").astype(str).str.strip().eq("")
+    entity = pd.Series([info.text.lower() for info in infos], index=out.index)
+    out.loc[blank_entity, "Level_6"] = entity[blank_entity]
+    company = pd.Series(
+        [bool(COMPANY_WORDS.search(word_variants(info.name or info.text))) for info in infos], index=out.index
+    ) & salary
+    out.loc[company, "Level_3"] = "institution"
+    out.loc[company, "Level_2"] = "User-generated"
+    _rederive_levels(out, cleared | salary, blank_second_level=salary)
+    # A debit never carries First Level "Salary": derive it again without the salary word.
+    debit_label = debit.gt(0) & out["First Level Classification"].astype(str).str.strip().str.lower().isin(
+        FIRST_LEVEL_NEVER_ON_DEBIT
+    )
+    if debit_label.any():
+        masked = out.loc[debit_label].copy()
+        masked["Particulars"] = masked["Particulars"].astype(str).map(lambda t: SALARY_WORD_MASK_RE.sub(" ", t))
+        _rederive_levels(masked, pd.Series(True, index=masked.index), blank_second_level=pd.Series(False, index=masked.index))
+        out.loc[debit_label, ["First Level Classification", "Second Level Classification"]] = masked[
+            ["First Level Classification", "Second Level Classification"]
+        ]
+    return out
+
+
+def _is_salary_cluster(cluster: list[int], dates: pd.Series) -> bool:
+    """Same payer, similar amount: salary when it recurs monthly, once a month, on a steady day."""
+
+    if len(cluster) < SALARY_MIN_MONTHS:
+        return False
+    months = dates.loc[cluster].dt.to_period("M")
+    if months.nunique() < SALARY_MIN_MONTHS:
+        return False
+    per_month = months.value_counts()
+    if (per_month == 1).sum() / len(per_month) < SALARY_MIN_ONE_PER_MONTH:
+        return False
+    day_std = dates.loc[cluster].dt.day.std(ddof=0)
+    return bool(pd.isna(day_std) or day_std <= SALARY_DAY_STD_MAX)
 
 
 def _has_any_flag(row: pd.Series, flag_columns: tuple[str, ...]) -> int:
@@ -280,18 +588,17 @@ def _analyze_one_group(
     window_frames: list[pd.DataFrame] = []
 
     salary_records = list(salary_df.iterrows())
+    salary_days = sorted({record["_date"].normalize() for _, record in salary_records})
     for event_number, (salary_index, salary_row) in enumerate(salary_records, start=1):
         salary_date = salary_row["_date"].normalize()
         natural_window_end = salary_date + pd.Timedelta(days=window_days - 1)
-        next_salary_date = pd.NaT
-        if event_number < len(salary_records):
-            next_salary_date = salary_records[event_number][1]["_date"].normalize()
-
+        # The next LATER salary date caps the window (events on the same day share one window),
+        # and a window never ends before its own salary date.
+        later_days = [day for day in salary_days if day > salary_date]
         window_end = natural_window_end
-        if pd.notna(next_salary_date):
-            clipped_end = next_salary_date - pd.Timedelta(days=1)
-            if clipped_end < window_end:
-                window_end = clipped_end
+        if later_days:
+            window_end = min(window_end, later_days[0] - pd.Timedelta(days=1))
+        window_end = max(window_end, salary_date)
 
         spend_mask = (
             working_df["_date"].dt.normalize().between(salary_date, window_end)

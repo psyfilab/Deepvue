@@ -1,4 +1,11 @@
-"""Micro-segmentation enrichment for classified bank statements."""
+"""Micro-segmentation enrichment for classified bank statements.
+
+Rule order for every segment flag:
+  1. Level 5 wins. When the classifier set a Level 5, the segment comes from the Level 5 table below.
+  2. Only when Level 5 is blank: the purpose tail of a UPI narration ("Groc-", "Trvl-"...), then keywords.
+  3. Keywords read the payee name part only, as whole words. The UPI handle, bank name, reference and
+     purpose tail are never read (a bank name never triggers a flag).
+"""
 
 from __future__ import annotations
 
@@ -8,35 +15,103 @@ from collections import defaultdict
 
 import pandas as pd
 
+from .salary_timeseries import (
+    payee_info,
+    purpose_tail,
+    purpose_text,
+    refine_salary,
+    strip_noise,
+    word_variants,
+)
 from .statement_classifier import parse_amount
 
 logger = logging.getLogger(__name__)
 
+# ------------------------------------------------------------------------------ Level 5 -> segment
+# One table for debit and credit; SEGMENT_DIRECTION says which side a segment may fire on.
 L5_SEGMENT_MAP = {
     "food": {"dining", "dining/bar", "dining/kirana", "food delivery"},
     "grocery": {"grocery", "groceries", "ecommerce/blinkit"},
     "ecomm": {"retail", "ecommerce"},
     "entertainment": {"entertainment", "entertainment/retail"},
-    "subscription": {"subscription"},
+    "sub": {"subscription"},
     "transport": {"transport", "transport/vehicle"},
     "travel": {"travel"},
-    "utility": {"utilities", "mobile recharge", "bill payment"},
+    "utility": {"utilities", "mobile recharge", "bill payment", "telecom"},
     "fuel": {"fuel"},
-    "pharmacy": {"pharmacy"},
+    "pharmacy": {"pharmacy", "healthcare"},
     "insurance": {"insurance"},
-    "investment": {"investment", "financial services"},
+    "investment": {"investment", "financial services", "dividend"},
     "loan": {"loan repayment"},
     "creditcard": {"credit card"},
-    "salary": {"salary"},
     "tax": {"tax"},
     "education": {"education", "education fees", "educational"},
-    "refund": {"refund"},
+    "refund": {"refund", "cashback"},
+    "penalty": {"interest", "charges"},
+    "own_account": {"wallet load", "wallet unload"},
+}
+L5_TO_SEGMENT = {value: segment for segment, values in L5_SEGMENT_MAP.items() for value in values}
+assert len(L5_TO_SEGMENT) == sum(len(v) for v in L5_SEGMENT_MAP.values()), "a Level 5 value is in two segments"
+
+# Which side of the statement each segment may fire on: debit, credit or any.
+SEGMENT_DIRECTION = {
+    "food": "debit", "grocery": "debit", "quick_comm": "debit", "ecomm": "debit", "entertainment": "debit",
+    "sub": "debit", "saving": "debit", "loan": "debit", "emi": "debit", "creditcard": "debit",
+    "utility": "debit", "fuel": "debit", "transport": "debit", "travel": "debit", "pharmacy": "debit",
+    "tax": "debit", "education": "debit", "refund": "credit",
+    "penalty": "any", "insurance": "any", "investment": "any", "own_account": "any",
+}
+SEGMENT_FLAG = {segment: f"exp_{segment}" for segment in (
+    "food", "grocery", "quick_comm", "ecomm", "entertainment", "sub", "saving", "investment", "loan",
+    "creditcard", "emi", "utility", "fuel", "transport", "travel", "pharmacy", "insurance", "tax",
+    "education", "penalty", "refund")}
+SEGMENT_FLAG["sub"] = "exp_sub"
+
+# Level 5 values too generic to decide a segment: keywords may read the payee, as if Level 5 were blank.
+GENERIC_LEVEL_5 = frozenset({"services", "other", "misc", "miscellaneous"})
+# When no segment came from Level 5 or keywords, the First Level Classification decides (credit card
+# payments, insurance, tax and refunds the classifier already identified).
+FIRST_LEVEL_SEGMENT = {
+    "credit card payment": "creditcard", "insurance": "insurance", "tax": "tax",
+    "refund/reversal": "refund", "inward online return": "refund", "refund": "refund",
 }
 
+# Level 5 blank rows: the purpose tag a UPI narration ends with decides the segment (None = no segment).
+PURPOSE_TAIL_SEGMENT = {
+    "groc": "grocery", "trvl": "travel", "wall": "own_account", "sub": "sub", "cab": "transport",
+    "inv": "investment", "cryp": "investment", "misc": None,
+    "hlth": "pharmacy", "phar": "pharmacy", "pharm": "pharmacy", "edu": "education", "shop": "ecomm",
+    "food": "food", "tran": "transport", "trav": "travel", "ente": "entertainment", "fuel": "fuel",
+    "rfnd": "refund",
+}
+
+# Extra keywords, merged with the Master sheet vocabulary (whole words, payee name only).
+BUILTIN_KEYWORDS = {
+    "grocery": {"bigbasket"},
+    "travel": {"makemytrip", "cleartrip", "yatra", "goibibo", "hotel", "hotels"},
+    "transport": {"uber", "ola", "rapido", "metro", "fastag"},
+}
+QUICK_COMMERCE_WORDS = ("blinkit", "grofers", "zepto", "instamart", "swiggy instamart", "bbnow", "dunzo",
+                        "flipkart minutes", "fk minutes", "amazon fresh")
+# A "financial services" Level 5 is a loan when the payee says so.
+LOAN_FINANCE_WORDS = ("emi", "loan", "fin", "finance", "finserv", "fintech", "kissht", "slice")
+EMI_WORDS = ("emi", "emis", "loan", "loans", "loan emi", "hand loan", "loan repay", "loan payment")
+PENALTY_WORDS = ("nach rtn", "bounce", "penalty", "late fee", "return chg", "sms chrg", "sms chrgs",
+                 "alert charge", "overdue", "chrg", "chrgs", "chg", "chgs", "charges", "surcharge",
+                 "markup", "imps sc", "transaction charges")
+SAVING_WORDS = ("fd", "fixed deposit", "rd", "recurring deposit", "ppf", "nps", "mutual fund", "sip")
+INSURANCE_WORDS = ("lic", "insurance", "policy", "premium", "acko", "policybazaar", "star health",
+                   "niva bupa", "hdfc ergo")
+REFUND_WORDS = ("refund", "reversal", "cashback", "reversed")
+ATM_WORDS = ("atm", "atm wdl", "cash wd", "cash withdrawal", "cash withd", "nwd", "atw")
+MEDICAL_WORDS = ("lab", "labs", "laboratory", "diagnostic", "diagnostics", "hospital", "hospitals", "clinic",
+                 "clinics", "fertility", "ivf", "pharmacy")
+
+# --------------------------------------------------------------------------- labels and priorities
 SEGMENT_PRIORITY = [
-    ("IsSalaryTxn", "Salary"),
-    ("exp_food", "Food"),
+    ("exp_penalty", "Penalty / Charges"),
     ("exp_quick_comm", "Quick Commerce"),
+    ("exp_food", "Food"),
     ("exp_grocery", "Grocery"),
     ("exp_ecomm", "Ecommerce"),
     ("exp_entertainment", "Entertainment"),
@@ -55,7 +130,6 @@ SEGMENT_PRIORITY = [
     ("exp_tax", "Tax"),
     ("exp_education", "Education"),
     ("exp_atm", "ATM Withdrawal"),
-    ("exp_penalty", "Penalty / Charges"),
     ("exp_refund", "Refund"),
     ("exp_luxury", "Luxury"),
     ("exp_micro", "Micro-spend"),
@@ -89,60 +163,23 @@ BIAS_WEIGHTS = {
     "exp_investment": -2.0,
 }
 
-L5_TO_SEGMENT = {
-    value.lower(): segment for segment, values in L5_SEGMENT_MAP.items() for value in values
-}
-
-# --- Table-driven rules (First Level values are lower-case; they come from the First Level classifier) ---
-# Luxury is a consumer discretionary spend: loans, ECS/NACH mandates, insurance, tax, rent, utilities,
-# own-account moves and B2B rails are never luxury, whatever the amount.
+# First Level values are lower-case; they come from the First Level classifier.
 LUXURY_EXCLUDED_FIRST_LEVEL = frozenset({
     "rtgs payment", "cheque payment", "neft payment", "ecs/nach payment", "insurance", "tax", "loan",
     "salary", "rent payment", "utility expenses", "contra", "credit card payment", "investment",
 })
+LUXURY_LEVEL_5 = frozenset({"", "retail", "services"})
+LUXURY_BLOCKING_SEGMENTS = frozenset({
+    "penalty", "loan", "emi", "investment", "saving", "tax", "insurance", "pharmacy", "own_account", "creditcard",
+})
+LUXURY_MIN, LUXURY_MAX = 5000, 500000
 CASH_WITHDRAWAL_FIRST_LEVEL = frozenset({"cash withdrawal", "atm withdrawal"})
-EMI_FIRST_LEVEL = frozenset({"credit card payment", "loan", "ecs/nach payment"})
 INWARD_FIRST_LEVEL = frozenset({"loan", "imps receipt", "neft receipt", "rtgs receipt", "cheque receipt", "online receipt"})
-# A credit is labelled Salary when the salary detector is sure (keyword + regular date = 1.0) or the
-# First Level already says Salary. Inferred-only credits (0.7) keep their normal label.
-SALARY_LABEL_MIN_CONFIDENCE = 1.0
-NEUTRAL_BIAS_LABELS = frozenset({"P2P Transfer"})  # person-to-person moves carry no present-bias signal
+NEUTRAL_BIAS_LABELS = frozenset({"P2P Transfer", "Own Account Transfer"})  # no present-bias signal
 
 MEANINGFUL_HASH_RE = re.compile(r"^[a-z0-9]{12,}$")
-# NWD / ATW are the debit-card cash-withdrawal prefixes ("NWD-517725XXXXXX4725-...").
-ATM_RE = re.compile(r"\b(atm|atm wdl|cash wd|cash withdrawal|cash withd|nwd|atw)\b", re.IGNORECASE)
-PENALTY_RE = re.compile(
-    r"\b(nach rtn|bounce|penalty|late fee|return chg|sms chrg|alert charge|fine|overdue|"
-    r"chrgs?|chgs?|surcharge|markup)\b",
-    re.IGNORECASE,
-)
-EMI_RE = re.compile(
-    r"\b(emi|loan emi|intrest emi|hand\s*loan|loan repay|loan payment)\b",
-    re.IGNORECASE,
-)
-SAVING_RE = re.compile(
-    # FD only as a whole word, and not the first half of a wrapped Federal
-    # Bank IFSC ("@FEDERAL-FD RL0001520" is FDRL0001520, not a deposit).
-    r"\b(fd(?!\s*rl\d)|fixed deposit|rd|recurring deposit|ppf|nps|mutual fund|sip)\b",
-    re.IGNORECASE,
-)
-# Mutual-fund houses and investment payments: ICICIMF, SBIMF, "MF SIP", and
-# narrations whose last segment is the "Inv" purpose tag (".../MERCHANT/Inv-").
-INVESTMENT_TEXT_RE = re.compile(
-    r"\b[a-z]{2,12}mf\b|\bmf\s*sip\b|/\s*inv(?:est(?:ment)?s?)?\s*-?\s*$",
-    re.IGNORECASE,
-)
-INSURANCE_RE = re.compile(
-    r"\b(lic|insurance|policy|premium|acko|policybazaar|star health|niva bupa|hdfc ergo)\b",
-    re.IGNORECASE,
-)
-REFUND_RE = re.compile(r"\b(refund|reversal|cashback|reversed)\b", re.IGNORECASE)
-SALARY_RE = re.compile(r"\b(salary|salaryxce|payroll|payslip|labour|wages|sal)\b", re.IGNORECASE)
-QUICK_COMM_RE = re.compile(
-    r"\b(blinkit|zepto|instamart|swiggy\s*instamart|swiggy\s*stores|bbnow|bigbasket|dunzo|"
-    r"flipkart\s*minutes|fk\s*minutes|amazon\s*fresh)\b",
-    re.IGNORECASE,
-)
+# A "/Inv-" style purpose tag is handled by PURPOSE_TAIL_SEGMENT; these two read the payee text.
+MF_HOUSE_RE = re.compile(r"(?<= )(?:[a-z]{2,12}mf|mf sip)(?= )")
 
 
 def is_meaningful_keyword(keyword: str) -> bool:
@@ -160,7 +197,7 @@ def is_meaningful_keyword(keyword: str) -> bool:
 
 
 def build_vocab(master_path: str) -> dict[str, frozenset[str]]:
-    """Build segment-specific keyword vocabularies from the master sheet."""
+    """Build segment-specific keyword vocabularies from the master sheet plus BUILTIN_KEYWORDS."""
 
     master_df = pd.read_csv(master_path, dtype=str, keep_default_na=False)
     master_df.columns = [column.strip() for column in master_df.columns]
@@ -170,24 +207,39 @@ def build_vocab(master_path: str) -> dict[str, frozenset[str]]:
         level_5 = str(row.get("Level 5", "")).strip().lower()
         segment = L5_TO_SEGMENT.get(level_5)
         keyword = str(row.get("Key Word", "")).strip().lower()
-        if segment and is_meaningful_keyword(keyword):
+        if segment and segment != "own_account" and is_meaningful_keyword(keyword):
             vocab[segment].add(keyword)
+    for segment, words in BUILTIN_KEYWORDS.items():
+        vocab[segment] |= set(words)
 
     return {segment: frozenset(values) for segment, values in vocab.items()}
 
 
-def build_regexes(vocab: dict[str, frozenset[str]]) -> dict[str, re.Pattern[str]]:
-    """Compile one regex per segment."""
+def phrase_regex(words) -> re.Pattern[str]:
+    """Whole-word regex over word_variants() text (every word has a space on both sides)."""
 
-    regexes: dict[str, re.Pattern[str]] = {}
-    for segment, keywords in vocab.items():
-        parts = []
-        for keyword in sorted(keywords, key=len, reverse=True):
-            escaped = re.escape(keyword)
-            parts.append(rf"\b{escaped}\b" if len(keyword) <= 5 else escaped)
-        if parts:
-            regexes[segment] = re.compile("|".join(parts), re.IGNORECASE)
-    return regexes
+    parts = []
+    for word in sorted({" ".join(re.sub(r"[^a-z0-9]+", " ", w.lower()).split()) for w in words}, key=len, reverse=True):
+        if word:
+            parts.append(re.escape(word))
+    return re.compile(r"(?<= )(?:" + "|".join(parts) + r")(?= )")
+
+
+def build_regexes(vocab: dict[str, frozenset[str]]) -> dict[str, re.Pattern[str]]:
+    """Compile one whole-word regex per segment."""
+
+    return {segment: phrase_regex(keywords) for segment, keywords in vocab.items() if keywords}
+
+
+QUICK_COMM_RE = phrase_regex(QUICK_COMMERCE_WORDS)
+LOAN_FINANCE_RE = phrase_regex(LOAN_FINANCE_WORDS)
+EMI_RE = phrase_regex(EMI_WORDS)
+PENALTY_RE = phrase_regex(PENALTY_WORDS)
+SAVING_RE = phrase_regex(SAVING_WORDS)
+INSURANCE_RE = phrase_regex(INSURANCE_WORDS)
+REFUND_RE = phrase_regex(REFUND_WORDS)
+ATM_RE = phrase_regex(ATM_WORDS)
+MEDICAL_RE = phrase_regex(MEDICAL_WORDS)
 
 
 def _label(row: pd.Series, column_name: str) -> str:
@@ -208,93 +260,47 @@ def _is_debit(row: pd.Series) -> bool:
     return float(row.get("debit_num", 0) or 0) > 0
 
 
-def _flag_segment(
-    row: pd.Series,
-    segment: str,
-    regexes: dict[str, re.Pattern[str]],
-    *,
-    debit_only: bool = False,
-    regex_if_unclassified_only: bool = False,
-) -> int:
-    """Return 1 when a row matches a segment via labels or regex.
-
-    debit_only                 -- spend segments never fire on a credit (refunds are handled separately).
-    regex_if_unclassified_only -- trust Level_5 when the classifier set one; the keyword regex is only a
-                                  fallback for rows with no Level_5 (the documented lookup order).
-    """
-
-    if debit_only and not _is_debit(row):
-        return 0
-    level_5 = _label(row, "Level_5")
-    if L5_TO_SEGMENT.get(level_5) == segment:
-        return 1
-    if regex_if_unclassified_only and level_5:
-        return 0
-    pattern = regexes.get(segment)
-    if pattern and pattern.search(_particulars(row)):
-        return 1
-    return 0
+def _is_credit(row: pd.Series) -> bool:
+    return float(row.get("credit_num", 0) or 0) > 0
 
 
-def _is_confirmed_salary(row: pd.Series) -> bool:
-    """A credit the salary detector is sure about, or that First Level already calls Salary."""
-
-    if float(row.get("credit_num", 0) or 0) <= 0 or int(row.get("IsSalaryTxn", 0) or 0) != 1:
-        return False
-    confidence = pd.to_numeric(row.get("SalaryConfidence", 0), errors="coerce")
-    return _label(row, "First Level Classification") == "salary" or (
-        pd.notna(confidence) and confidence >= SALARY_LABEL_MIN_CONFIDENCE
-    )
+def _direction_ok(segment: str, debit: bool, credit: bool) -> bool:
+    side = SEGMENT_DIRECTION.get(segment, "any")
+    return side == "any" or (side == "debit" and debit) or (side == "credit" and credit)
 
 
 def _assign_microsegment(row: pd.Series) -> str:
     """Assign one final micro-segment label."""
 
-    # Structural facts first: a confirmed salary or a cash withdrawal is never a P2P transfer, even when
-    # an upstream Level_3 tag says p2p.
-    if _is_confirmed_salary(row):
+    level_5, level_3 = _label(row, "Level_5"), _label(row, "Level_3")
+    first_level = _label(row, "First Level Classification")
+    # Structural facts first: Level 5 salary or wallet moves, and cash withdrawals by First Level.
+    if level_5 == "salary" and _is_credit(row):
         return "Salary"
-    if _is_debit(row) and _label(row, "First Level Classification") in CASH_WITHDRAWAL_FIRST_LEVEL:
+    if level_5 in L5_SEGMENT_MAP["own_account"] or row.get("_own_account") == 1:
+        return "Own Account Transfer"
+    if _is_debit(row) and first_level in CASH_WITHDRAWAL_FIRST_LEVEL:
         return "ATM Withdrawal"
-    if _label(row, "Level_3") == "p2p":
-        return "P2P Transfer"
-    if _label(row, "Level_5") == "digital services" and _label(row, "Level_3") != "p2p":
+    l5_has_segment = level_5 in L5_TO_SEGMENT
+    if level_5 == "digital services" and level_3 != "p2p":
         return "Digital Payment"
+    if level_3 == "p2p" and not l5_has_segment:
+        return "P2P Transfer"  # Level 5 wins over p2p only when Level 5 maps to a segment
     for column_name, label in SEGMENT_PRIORITY:
         if int(row.get(column_name, 0) or 0) == 1:
             return label
-    if float(row.get("credit_num", 0) or 0) > 0 and _label(row, "First Level Classification") in INWARD_FIRST_LEVEL:
+    if _is_credit(row) and first_level in INWARD_FIRST_LEVEL:
         return "Inward Transfer"
     return "Other"
 
 
-def _flag_quick_comm(row: pd.Series) -> int:
-    """Return 1 for fast-delivery grocery and convenience apps."""
-
-    text = " ".join(
-        [
-            _particulars(row),
-            str(row.get("Level_6", "") or ""),
-        ]
-    ).strip()
-    return int(
-        row.get("debit_num", 0) > 0
-        and QUICK_COMM_RE.search(text) is not None
-    )
-
-
 def _compute_bias(row: pd.Series) -> float:
-    """Compute a simple present-bias score from segment flags (P2P transfers are neutral)."""
+    """Present-bias score: weighted spend flags. Credits, P2P and own-account moves are neutral."""
 
-    if row.get("MicroSegment") in NEUTRAL_BIAS_LABELS:
+    if row.get("MicroSegment") in NEUTRAL_BIAS_LABELS or not _is_debit(row):
         return 0.0
-
     return round(
-        sum(
-            weight
-            for column_name, weight in BIAS_WEIGHTS.items()
-            if int(row.get(column_name, 0) or 0) == 1
-        ),
+        sum(weight for column_name, weight in BIAS_WEIGHTS.items() if int(row.get(column_name, 0) or 0) == 1),
         2,
     )
 
@@ -303,186 +309,126 @@ class Microsegmenter:
     """Enrich classified transactions with consumer micro-segmentation flags."""
 
     def __init__(self, master_sheet_path: str) -> None:
-        """Build regex vocabularies from the local master sheet."""
+        """Build whole-word vocabularies from the local master sheet."""
 
         self.vocab = build_vocab(master_sheet_path)
         self.regexes = build_regexes(self.vocab)
 
+    # ------------------------------------------------------------------ one row
+    def _segments(self, row: pd.Series) -> tuple[set[str], str, bool, str]:
+        """Segments for one row, plus the payee text, whether the payee is a bank, and the purpose text."""
+
+        debit, credit = _is_debit(row), _is_credit(row)
+        narration = _particulars(row)
+        info = payee_info(narration, row.get("Level_6", ""))
+        payee = word_variants(info.text)
+        purpose = word_variants(purpose_text(narration))
+        words = word_variants(strip_noise(narration))
+        level_5 = _label(row, "Level_5")
+        segments: set[str] = set()
+
+        if level_5 and level_5 not in GENERIC_LEVEL_5:  # Level 5 always wins
+            segment = L5_TO_SEGMENT.get(level_5)
+            if segment == "grocery" and QUICK_COMM_RE.search(payee + purpose):
+                segment = "quick_comm"
+            if level_5 == "financial services" and LOAN_FINANCE_RE.search(payee + purpose):
+                segment = "loan"
+            if segment:
+                segments.add(segment)
+            if level_5 in {"digital services"} and _label(row, "Level_7") == "recurring":
+                segments.add("sub")
+        else:
+            tail = purpose_tail(narration)
+            if tail in PURPOSE_TAIL_SEGMENT:
+                if PURPOSE_TAIL_SEGMENT[tail]:
+                    segments.add(PURPOSE_TAIL_SEGMENT[tail])
+            else:
+                if not info.is_bank:
+                    for segment, pattern in self.regexes.items():
+                        if segment != "own_account" and pattern.search(payee):
+                            segments.add(segment)
+                    if QUICK_COMM_RE.search(payee):
+                        segments.add("quick_comm")
+                    if MF_HOUSE_RE.search(payee):
+                        segments.add("investment")
+                    if PENALTY_RE.search(payee):
+                        segments.add("penalty")
+                    if SAVING_RE.search(payee):
+                        segments.add("saving")
+                    if INSURANCE_RE.search(payee):
+                        segments.add("insurance")
+                if PENALTY_RE.search(words) and not info.name:  # bank-written lines carry no payee
+                    segments.add("penalty")
+                if EMI_RE.search(payee + purpose) or (not info.name and EMI_RE.search(words)):
+                    segments.add("emi")
+                if REFUND_RE.search(words):
+                    segments.add("refund")
+        if "quick_comm" in segments:
+            segments.discard("grocery")
+        segments = {s for s in segments if _direction_ok(s, debit, credit)}
+        fallback = FIRST_LEVEL_SEGMENT.get(_label(row, "First Level Classification"))
+        if not segments and fallback and _direction_ok(fallback, debit, credit):
+            segments.add(fallback)
+        return segments, payee, info.is_bank, purpose
+
+    def _row_flags(self, row: pd.Series) -> dict[str, int]:
+        segments, payee, is_bank, purpose = self._segments(row)
+        debit_amount = float(row.get("debit_num", 0) or 0)
+        level_5, level_3 = _label(row, "Level_5"), _label(row, "Level_3")
+        first_level = _label(row, "First Level Classification")
+        own_account = "own_account" in segments or level_5 in L5_SEGMENT_MAP["own_account"]
+        if level_5 in L5_SEGMENT_MAP["own_account"]:
+            segments.add("own_account")
+        flags = {column: int(segment in segments) for segment, column in SEGMENT_FLAG.items()}
+        if level_5 == "digital services":
+            flags["exp_sub"] = int("sub" in segments and debit_amount > 0)
+
+        words = word_variants(strip_noise(_particulars(row)))
+        flags["exp_atm"] = int(
+            debit_amount > 0
+            and "penalty" not in segments
+            and (first_level in CASH_WITHDRAWAL_FIRST_LEVEL or (not level_5 and bool(ATM_RE.search(words))))
+        )
+        flags["exp_micro"] = int(0 < debit_amount < 200 and not own_account)
+        flags["exp_luxury"] = int(
+            level_3 == "merchant"
+            and level_5 in LUXURY_LEVEL_5
+            and LUXURY_MIN < debit_amount <= LUXURY_MAX
+            and first_level not in LUXURY_EXCLUDED_FIRST_LEVEL
+            and not (segments & LUXURY_BLOCKING_SEGMENTS)
+            and not is_bank
+            and not MEDICAL_RE.search(payee + purpose)
+        )
+        flags["exp_upi_velocity"] = int(0 < debit_amount < 500 and _label(row, "Level_1") == "upi" and not own_account)
+        flags["_own_account"] = int(own_account)
+        return flags
+
+    # ------------------------------------------------------------------ whole frame
     def run(self, df: pd.DataFrame) -> pd.DataFrame:
         """Return an enriched dataframe with segment flags and scores."""
 
-        output_df = df.copy()
+        output_df = refine_salary(df)  # Salary Flag, Level 3 / 5 and First Level settle before segments
         output_df["debit_num"] = output_df["Debit"].apply(parse_amount)
         output_df["credit_num"] = output_df["Credit"].apply(parse_amount)
 
-        output_df["exp_food"] = output_df.apply(
-            lambda row: _flag_segment(row, "food", self.regexes, debit_only=True), axis=1
-        )
-        output_df["exp_grocery"] = output_df.apply(
-            lambda row: _flag_segment(row, "grocery", self.regexes, debit_only=True), axis=1
-        )
-        output_df["exp_quick_comm"] = output_df.apply(_flag_quick_comm, axis=1)
-        output_df["exp_ecomm"] = output_df.apply(
-            lambda row: _flag_segment(row, "ecomm", self.regexes, debit_only=True), axis=1
-        )
-        output_df["exp_entertainment"] = output_df.apply(
-            lambda row: _flag_segment(row, "entertainment", self.regexes, debit_only=True), axis=1
-        )
-        output_df["exp_sub"] = output_df.apply(
-            lambda row: int(
-                _flag_segment(row, "subscription", self.regexes, debit_only=True) == 1
-                or (
-                    _is_debit(row)
-                    and _label(row, "Level_7") == "recurring"
-                    and _label(row, "Level_5") in {"subscription", "digital services"}
-                )
-            ),
-            axis=1,
-        )
-        output_df["exp_micro"] = output_df["debit_num"].apply(lambda value: int(0 < value < 200))
-        output_df["exp_luxury"] = output_df.apply(
-            lambda row: int(
-                5000 < row["debit_num"] <= 500000
-                and _label(row, "Level_3") != "p2p"
-                and _label(row, "First Level Classification") not in LUXURY_EXCLUDED_FIRST_LEVEL
-                and _label(row, "Level_5")
-                not in {
-                    "utilities",
-                    "mobile recharge",
-                    "salary",
-                    "p2p transfer",
-                    "loan repayment",
-                    "credit card",
-                    "insurance",
-                    "investment",
-                    "tax",
-                }
-            ),
-            axis=1,
-        )
-        output_df["exp_saving"] = output_df.apply(
-            lambda row: int(
-                row["debit_num"] > 0
-                and SAVING_RE.search(_particulars(row)) is not None
-            ),
-            axis=1,
-        )
-        output_df["exp_investment"] = output_df.apply(
-            lambda row: int(
-                row["debit_num"] > 0
-                and (
-                    _flag_segment(row, "investment", self.regexes) == 1
-                    or _label(row, "First Level Classification") == "investment"
-                    or INVESTMENT_TEXT_RE.search(_particulars(row)) is not None
-                )
-            ),
-            axis=1,
-        )
-        # Loan: Level_5 decides when the classifier set one; the keyword regex is only a fallback for
-        # rows with no Level_5. Money-out only (a loan disbursement is not a repayment).
-        output_df["exp_loan"] = output_df.apply(
-            lambda row: int(
-                _is_debit(row)
-                and (
-                    _flag_segment(
-                        row, "loan", self.regexes, debit_only=True, regex_if_unclassified_only=True
-                    ) == 1
-                    or EMI_RE.search(_particulars(row)) is not None
-                )
-            ),
-            axis=1,
-        )
-        output_df["exp_creditcard"] = output_df.apply(
-            lambda row: int(_flag_segment(row, "creditcard", self.regexes, debit_only=True) == 1), axis=1
-        )
-        # EMI: a loan / card / mandate debit by First Level, or an EMI keyword. Being "recurring" alone
-        # (rent, SIPs, subscriptions) is not an EMI.
-        output_df["exp_emi"] = output_df.apply(
-            lambda row: int(
-                _is_debit(row)
-                and (
-                    _label(row, "First Level Classification") in EMI_FIRST_LEVEL
-                    or EMI_RE.search(_particulars(row)) is not None
-                )
-            ),
-            axis=1,
-        )
-        output_df["exp_utility"] = output_df.apply(
-            lambda row: int(_flag_segment(row, "utility", self.regexes, debit_only=True) == 1), axis=1
-        )
-        output_df["exp_fuel"] = output_df.apply(
-            lambda row: int(_flag_segment(row, "fuel", self.regexes, debit_only=True) == 1), axis=1
-        )
-        output_df["exp_transport"] = output_df.apply(
-            lambda row: int(_flag_segment(row, "transport", self.regexes, debit_only=True) == 1), axis=1
-        )
-        output_df["exp_travel"] = output_df.apply(
-            lambda row: int(_flag_segment(row, "travel", self.regexes, debit_only=True) == 1), axis=1
-        )
-        output_df["exp_pharmacy"] = output_df.apply(
-            lambda row: int(_flag_segment(row, "pharmacy", self.regexes, debit_only=True) == 1), axis=1
-        )
-        output_df["exp_insurance"] = output_df.apply(
-            lambda row: int(
-                row["debit_num"] > 0
-                and (
-                    _flag_segment(row, "insurance", self.regexes) == 1
-                    or INSURANCE_RE.search(_particulars(row)) is not None
-                )
-            ),
-            axis=1,
-        )
-        output_df["exp_tax"] = output_df.apply(
-            lambda row: int(_flag_segment(row, "tax", self.regexes, debit_only=True) == 1), axis=1
-        )
-        output_df["exp_education"] = output_df.apply(
-            lambda row: int(_flag_segment(row, "education", self.regexes, debit_only=True) == 1), axis=1
-        )
-        output_df["exp_atm"] = output_df.apply(
-            lambda row: int(
-                _is_debit(row)
-                and (
-                    _label(row, "First Level Classification") in CASH_WITHDRAWAL_FIRST_LEVEL
-                    or ATM_RE.search(_particulars(row)) is not None
-                )
-            ),
-            axis=1,
-        )
-        output_df["exp_penalty"] = output_df["Particulars"].astype(str).apply(
-            lambda value: int(PENALTY_RE.search(value) is not None)
-        )
-        output_df["exp_refund"] = output_df.apply(
-            lambda row: int(
-                row["credit_num"] > 0
-                and (
-                    _flag_segment(row, "refund", self.regexes) == 1
-                    or REFUND_RE.search(_particulars(row)) is not None
-                )
-            ),
-            axis=1,
-        )
-        output_df["exp_upi_velocity"] = output_df.apply(
-            lambda row: int(
-                0 < row["debit_num"] < 500 and _label(row, "Level_1") == "upi"
-            ),
-            axis=1,
-        )
-        output_df["IsSalaryTxn"] = output_df.apply(
-            lambda row: int(
-                int(row.get("IsSalary", 0) or 0) == 1
-                or (
-                    row["credit_num"] > 0
-                    and (
-                        _label(row, "Level_5") == "salary"
-                        or SALARY_RE.search(_particulars(row)) is not None
-                    )
-                )
-            ),
-            axis=1,
-        )
+        flag_rows = [self._row_flags(row) for _, row in output_df.iterrows()]
+        flag_frame = pd.DataFrame(flag_rows, index=output_df.index)
+        for column in (
+            "exp_food", "exp_grocery", "exp_quick_comm", "exp_ecomm", "exp_entertainment", "exp_sub",
+            "exp_micro", "exp_luxury", "exp_saving", "exp_investment", "exp_loan", "exp_creditcard",
+            "exp_emi", "exp_utility", "exp_fuel", "exp_transport", "exp_travel", "exp_pharmacy",
+            "exp_insurance", "exp_tax", "exp_education", "exp_atm", "exp_penalty", "exp_refund",
+            "exp_upi_velocity",
+        ):
+            output_df[column] = flag_frame[column].astype(int) if len(flag_frame) else 0
+        output_df["IsSalaryTxn"] = (
+            output_df["IsSalary"].fillna(0).astype(int).eq(1) & output_df["credit_num"].gt(0)
+        ).astype(int)
 
+        output_df["_own_account"] = flag_frame["_own_account"] if len(flag_frame) else 0
         output_df["MicroSegment"] = output_df.apply(_assign_microsegment, axis=1)
         output_df["present_bias_score"] = output_df.apply(_compute_bias, axis=1)
+        output_df = output_df.drop(columns=["_own_account"])
 
         logger.info("Enriched %s rows with micro-segmentation flags", len(output_df))
         return output_df
