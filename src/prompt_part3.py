@@ -114,6 +114,8 @@ GENERIC_PLATFORM_TOKENS = frozenset(
 
 BUSINESS_TOKENS = frozenset(
     {
+        "llp",
+        "merchant",
         "agency",
         "agencies",
         "airtel",
@@ -303,7 +305,7 @@ MANUAL_PLATFORM_ALIASES: dict[str, tuple[str, ...]] = {
     "kotak mahindra bank": ("kotakmahindrabank", "kotak", "kmb"),
     "airtel payments bank": ("airtelpaymentsbank",),
     "india post payments bank": ("indiapostpaymentsbank", "ippb"),
-    "paytm": ("paytm",),
+    "paytm": ("paytm", "one97", "one97communications"),
     "google pay": ("googlepay", "gpay"),
     "phonepe": ("phonepe",),
     "amazon pay": ("amazonpay",),
@@ -333,6 +335,12 @@ MANUAL_PLATFORM_ALIASES: dict[str, tuple[str, ...]] = {
     "south indian bank": ("sib",),
     "rbl bank": ("rblbank", "rbl"),
 }
+
+# Labels that name a platform or gateway, not a bank.
+PLATFORM_ONLY_LABELS = frozenset(
+    {"paytm", "google pay", "phonepe", "amazon pay", "razorpay", "payu", "cashfree", "bharatpe",
+     "freecharge", "mobikwik", "cred", "billdesk"}
+)
 
 MANUAL_MERCHANT_HINTS: dict[str, dict[str, str]] = {
     "zomato": {"Level_3": "merchant", "Level_5": "dining", "Level_6": "zomato"},
@@ -445,7 +453,17 @@ def _tok(*alternatives: str) -> str:
 PURPOSE_PATTERNS: list[tuple[re.Pattern[str], str]] = [
     (re.compile(r"\btax\b|" + _tok("[cis]?gst", "stax") + r"|itdtax", re.IGNORECASE), "tax"),
     (re.compile(r"\bsalary|payroll|labour|" + _tok("wages") + r"|\bsal\b", re.IGNORECASE), "salary"),
-    (re.compile(r"credit card|" + _tok("ccbp") + r"|cc payment", re.IGNORECASE), "credit card"),
+    (
+        re.compile(
+            r"credit card|" + _tok("ccbp") + r"|cc payment"
+            # "CC 000558983XXXXXX9920 AUTOPAY SI-MAD": a card auto-pay is a credit card bill.
+            r"|(?<![a-z])cc(?![a-z])[^/]{0,40}?auto\s*pay",
+            re.IGNORECASE,
+        ),
+        "credit card",
+    ),
+    # Dividend on its own word or fused to a type word (INTDIV, FINDIV, SPLDIV).
+    (re.compile(r"(?:int|fin|spl)div|(?<![a-z])div(?:idends?)?(?![a-z])", re.IGNORECASE), "dividend"),
     (
         re.compile(
             r"\bemi\b|loan repay|loan emi|intrest emi|interest emi"
@@ -619,11 +637,54 @@ def clean_entity(value: str, level_4_value: str = "") -> str:
     return entity
 
 
-def keyword_supports_bank(keyword_compact: str, bank_name: str, alias: str) -> bool:
-    """Return whether an alias is explicit enough to support a bank/platform label."""
+# Aliases that collide with ordinary words ("cred" inside "credit", "credi", "credited") and
+# aliases with a digit ("one97") match only as a whole token or a run of whole tokens. Any other
+# short platform alias must start a token ("payu" in "payupaymen", never inside "xpayux").
+STRICT_WHOLE_TOKEN_ALIASES = frozenset({"cred"})
+SHORT_ALIAS_MAX_LETTERS = 4
+
+
+def alias_is_whole_token_only(alias: str) -> bool:
+    """Return True for an alias that must stand alone as a token."""
+
+    return alias in STRICT_WHOLE_TOKEN_ALIASES or any(ch.isdigit() for ch in alias)
+
+
+def alias_in_tokens(alias: str, tokens: list[str]) -> bool:
+    """Return True when the alias equals one token or consecutive tokens joined."""
 
     if not alias:
         return False
+    for start in range(len(tokens)):
+        joined = ""
+        for token in tokens[start:]:
+            joined += token
+            if joined == alias:
+                return True
+            if not alias.startswith(joined):
+                break
+    return False
+
+
+def keyword_supports_bank(
+    keyword_compact: str,
+    bank_name: str,
+    alias: str,
+    tokens: list[str] | None = None,
+) -> bool:
+    """Return whether an alias is explicit enough to support a bank/platform label.
+
+    A platform (not a bank) alias that is short, or has a digit, needs a whole-token
+    match when the keyword's tokens are given.
+    """
+
+    if not alias:
+        return False
+    if tokens is not None and bank_name in PLATFORM_ONLY_LABELS:
+        if alias_is_whole_token_only(alias):
+            return alias_in_tokens(alias, tokens)
+        if len(alias) <= SHORT_ALIAS_MAX_LETTERS:
+            return alias_in_tokens(alias, tokens) or any(token.startswith(alias) for token in tokens)
     if len(alias) <= 3:
         return (
             keyword_compact == alias
@@ -641,6 +702,7 @@ def detect_platform_or_bank(keyword: str, merchant_aliases: dict[str, dict[str, 
     """Detect explicit banks or payment platforms from the keyword."""
 
     keyword_compact = compact_text(keyword)
+    tokens = normalize_spaces(keyword).split()
     if merchant_aliases:
         for alias in sorted(merchant_aliases, key=len, reverse=True):
             if alias in keyword_compact:
@@ -648,7 +710,7 @@ def detect_platform_or_bank(keyword: str, merchant_aliases: dict[str, dict[str, 
 
     for canonical_name, aliases in MANUAL_PLATFORM_ALIASES.items():
         for alias in aliases:
-            if keyword_supports_bank(keyword_compact, canonical_name, compact_text(alias)):
+            if keyword_supports_bank(keyword_compact, canonical_name, compact_text(alias), tokens):
                 return canonical_name
     return ""
 
@@ -776,6 +838,23 @@ def is_rail_platform_only_keyword(keyword: str) -> bool:
     return tokens.issubset(RAIL_TOKENS | GENERIC_PLATFORM_TOKENS)
 
 
+# A company-form word in a name: the counterparty is a business (or a bank or government
+# body), never a person, on every rail.
+COMPANY_NAME_RE = re.compile(
+    r"(?<![a-z])(?:pvt\.?\s*ltd|private\s+limited|limited|ltd|llp|technologies|services"
+    r"|enterprises|industries|merchant)(?![a-z])",
+    re.IGNORECASE,
+)
+# "YES BANK LTD", "HDFC BANK LIMITED": a bank's own legal name.
+BANK_LEGAL_NAME_RE = re.compile(r"\b(?:[a-z]+\s+){0,3}bank\s+(?:ltd|limited)\b", re.IGNORECASE)
+
+
+def is_company_name(text: str) -> bool:
+    """Return True when the name carries a company-form word (bank legal names count)."""
+
+    return bool(COMPANY_NAME_RE.search(str(text or "")))
+
+
 def looks_like_person_name(text: str) -> bool:
     """Return whether a cleaned string looks like a person name."""
 
@@ -792,7 +871,7 @@ def looks_like_person_name(text: str) -> bool:
     token_set = set(tokens)
     if token_set.issubset(RAIL_TOKENS | GENERIC_PLATFORM_TOKENS):
         return False
-    if token_set & BUSINESS_TOKENS:
+    if token_set & BUSINESS_TOKENS or is_company_name(normalized):
         return False
     if any(substring in normalized.replace(" ", "") for substring in BUSINESS_SUBSTRINGS):
         return False

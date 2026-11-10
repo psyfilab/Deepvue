@@ -14,14 +14,35 @@ import pandas as pd
 # and direct module loading from the repository root / ``src`` directory.
 if __package__:
     from .predict import KeywordClassifier
-    from .prompt_part3 import REAL_DIGITAL_BRANDS, brand_alternation, clean_entity, detect_explicit_purpose
+    from .prompt_part3 import (
+        BANK_LEGAL_NAME_RE,
+        REAL_DIGITAL_BRANDS,
+        brand_alternation,
+        clean_entity,
+        detect_explicit_purpose,
+        is_company_name,
+    )
 else:  # pragma: no cover - used by IDEs or scripts loading this file directly
     try:
         from src.predict import KeywordClassifier
-        from src.prompt_part3 import REAL_DIGITAL_BRANDS, brand_alternation, clean_entity, detect_explicit_purpose
+        from src.prompt_part3 import (
+            BANK_LEGAL_NAME_RE,
+            REAL_DIGITAL_BRANDS,
+            brand_alternation,
+            clean_entity,
+            detect_explicit_purpose,
+            is_company_name,
+        )
     except ModuleNotFoundError:
         from predict import KeywordClassifier
-        from prompt_part3 import REAL_DIGITAL_BRANDS, brand_alternation, clean_entity, detect_explicit_purpose
+        from prompt_part3 import (
+            BANK_LEGAL_NAME_RE,
+            REAL_DIGITAL_BRANDS,
+            brand_alternation,
+            clean_entity,
+            detect_explicit_purpose,
+            is_company_name,
+        )
 
 logger = logging.getLogger(__name__)
 
@@ -152,7 +173,7 @@ MERCHANT_MARKER_RE = re.compile(
 # Whole words only, so "cashfree" or "cashback" never match. WDL / WITHDRAWAL /
 # EAW / NFS are cash only when the narration is not a charge or fee.
 ATM_WITHDRAWAL_RE = re.compile(
-    r"\bATM[\s\-/|]*WDL\b|\bATM\s*[/|]\s*DR\s*(?:[/|]|$)|\bATW(?![A-Za-z])"
+    r"\bATM[\s\-/|]*WDL\b|\bATM\s*[/|]\s*DR\s*(?:[/|]|$)|\bATW(?![A-Za-z])|\bNWD(?![A-Za-z])"
     r"|\b(?:WDL|WITHDRAWAL|EAW|NFS)(?![A-Za-z])(?!.*\b(?:CHG|CHGS|CHARGES?|FEES?)\b)",
     flags=re.IGNORECASE,
 )
@@ -234,7 +255,7 @@ KNOWN_UPI_MERCHANTS = {
     "ferticityivfclinic": "ferticity ivf clinic",
 }
 PAYMENT_INTERMEDIARY_FRAGMENTS = frozenset(
-    {"gpay", "google", "paytm", "phonepe", "razorpay", "bharatpe", "mobikwik", "cred", "payu", "cashfree"}
+    {"gpay", "google", "paytm", "one97", "phonepe", "razorpay", "bharatpe", "mobikwik", "cred", "payu", "cashfree"}
 )
 KNOWN_MERCHANT_FRAGMENTS = GATEWAY_VPA_FRAGMENTS - PAYMENT_INTERMEDIARY_FRAGMENTS
 MERCHANT_DEFAULT_PURPOSES = {
@@ -314,7 +335,7 @@ PLATFORM_ALIASES = {
     "google pay": ("google pay", "googlepay", "gpay", "tez", "okbizaxis", "okpayaxis"),
     "phonepe": ("phonepe", "phone pe"),
     "jupiter": ("jupiteraxis",),
-    "paytm": ("paytm", "paytm upi", "paytm payments bank"),
+    "paytm": ("paytm", "paytm upi", "paytm payments bank", "one97", "one97 communications"),
     "amazon pay": ("amazon pay", "amazonpay"),
     "bhim": ("bhim", "bharat interface for money"),
     "bharatpe": ("bharatpe", "bharat pe"),
@@ -1901,7 +1922,7 @@ def is_payment_intermediary_label(label: str) -> bool:
         return False
     if value in PLATFORM_ALIASES:
         return True
-    letters = re.sub(r"[^a-z]", "", value)
+    letters = re.sub(r"[^a-z0-9]", "", value)  # digits stay: "one97" is a brand token
     return any(fragment in letters for fragment in PAYMENT_INTERMEDIARY_FRAGMENTS)
 
 
@@ -3231,7 +3252,7 @@ def apply_pre_detect_salary_overrides(df: pd.DataFrame) -> pd.DataFrame:
 
         # Rule 1: RTN CHG bank charge
         if RTN_CHG_RE.match(text):
-            output_df.at[idx, "Level_1"] = "cheque"
+            output_df.at[idx, "Level_1"] = level1_from_rail_word(text)
             output_df.at[idx, "Level_3"] = "institution"
             output_df.at[idx, "Level_5"] = "charges"
             output_df.at[idx, "Level_6"] = "bank charges"
@@ -3875,6 +3896,242 @@ def apply_level7_recurrence(df: pd.DataFrame) -> pd.DataFrame:
     return output_df
 
 
+# ---------------------------------------------------------------------------
+# Final Level 1 to Level 5 rules. Every rule is a row in a table below; adding a
+# bank's prefix or a new purpose cue is one row, not a code change.
+# ---------------------------------------------------------------------------
+_LEAD_REF = r"^\s*(?:\d{6,}\s*[-:/ ]\s*)?"
+# "Chq: 0" / "Chq: 518512326492" at the end of a narration is the statement's own cheque-number
+# column, not evidence of a cheque.
+LEVEL1_TRAILING_CHQ_RE = re.compile(r"(?:\s*Chq\s*:?\s*[A-Za-z0-9]*)+\s*$", flags=re.IGNORECASE)
+# A returned (bounced) cheque: "REJECT:<no>:<reason>". The reason text is never a payee.
+REJECT_RE = re.compile(r"^\s*REJECT\s*:", flags=re.IGNORECASE)
+BOUNCED_CHEQUE_LEVELS = {
+    "Level_1": "cheque",
+    "Level_2": "System generated",
+    "Level_3": "",
+    "Level_4": "",
+    "Level_5": "",
+    "Level_6": "",
+    "Level_7": "one-time",
+}
+# The rail a charge, interest or fee line names in its own text (first listed wins).
+LEVEL1_RAIL_WORDS: tuple[tuple[re.Pattern, str], ...] = tuple(
+    (re.compile(pattern, flags=re.IGNORECASE), value)
+    for pattern, value in (
+        (r"(?<![A-Za-z])imps(?![A-Za-z])", "imps"),
+        (r"(?<![A-Za-z])neft(?![A-Za-z])", "neft"),
+        (r"(?<![A-Za-z])rtgs(?![A-Za-z])", "rtgs"),
+        (r"(?<![A-Za-z])upi(?![A-Za-z])", "upi"),
+        (r"(?<![A-Za-z])(?:ach|ecs|nach|enach|mandate)(?![A-Za-z])", "nach"),
+    )
+)
+
+
+def level1_from_rail_word(text: str) -> str:
+    """Return the rail a narration spells out (imps, nach ...), or "" when it names none."""
+
+    core = LEVEL1_TRAILING_CHQ_RE.sub("", str(text or ""))
+    for pattern, value in LEVEL1_RAIL_WORDS:
+        if pattern.search(core):
+            return value
+    return ""
+
+
+# (name, pattern, Level 1) tried in order against the narration without its "Chq:" tail.
+# "@rail" = the rail word in the text, blank when there is none. "" = leave blank on purpose:
+# these prefixes are not understood well enough to guess.
+LEVEL1_FINAL_RULES: tuple[tuple[str, re.Pattern, str], ...] = tuple(
+    (name, re.compile(pattern, flags=re.IGNORECASE), value)
+    for name, pattern, value in (
+        (
+            "charge_or_interest",
+            _LEAD_REF + r"(?:SBINT(?![A-Za-z])|INT\.?\s*COLL(?![A-Za-z])|SMS\s+CHARGES?(?![A-Za-z])"
+            r"|IMPS\s+SC(?![A-Za-z])|ECS\s+MANDATE\s+SC(?![A-Za-z])|ECS\s+DR\s+RTN\s+SC(?![A-Za-z])"
+            r"|RTN\s+CHG(?![A-Za-z])|RETURN\s+CHARGE(?![A-Za-z]))",
+            "@rail",
+        ),
+        ("not_guessed", r"^\s*(?:MB/|CMS(?![A-Za-z])|GIB(?![A-Za-z])|TAB-|BIL/)", ""),
+        ("cheque", r"^\s*(?:(?:TO|BY)\s+)?(?:CHQ|CLG|CHEQUE|CLEARING)(?![A-Za-z])", "cheque"),
+        (
+            "internal_transfer",
+            _LEAD_REF + r"(?:IFT|INF/INFT|INFT|TRFR|TRF|TPT|IB\s+FUNDS\s+TRANSFER)(?![A-Za-z])",
+            "internal transfer",
+        ),
+        ("cash", r"(?<![A-Za-z])(?:NWD|ATW|ATM[\s\-/|]*WDL|CASH\s+DEP(?:OSIT)?)(?![A-Za-z])", "cash"),
+        ("nach", r"(?<![A-Za-z])(?:ACH|ECS|NACH|ENACH|MANDATE)(?![A-Za-z])", "nach"),
+    )
+)
+
+
+def decide_level1(text: str, current: str = "") -> str:
+    """Return the final Level 1 for a narration; ``current`` is kept when no rule speaks."""
+
+    core = LEVEL1_TRAILING_CHQ_RE.sub("", str(text or "")).strip()
+    if CHEQUE_INSTRUMENT_RE.match(core):
+        return "cheque"
+    for name, pattern, value in LEVEL1_FINAL_RULES:
+        if not pattern.search(core):
+            continue
+        if name == "nach" and UPI_START_RE.match(core):
+            continue  # "UPI/.../MANDATE" is a UPI mandate; the UPI structure decides
+        return level1_from_rail_word(core) if value == "@rail" else value
+    held = str(current or "").strip().lower()
+    if held == "auto-debit":
+        return "nach"
+    if held == "cheque":
+        # "cheque" needs a cheque word at the start; a stray flag is dropped, then the
+        # structural prefixes get another chance.
+        refilled = apply_level1_structural_fill(core, {"Level_1": ""})
+        return refilled["Level_1"]
+    return str(current or "")
+
+
+# Level 3: a company-form word in the payee is a business on every rail.
+P2M_PAYEE_RE = re.compile(r"/P2M/[^/]*/([^/]+)/", flags=re.IGNORECASE)
+BANK_PAYEE_RE = re.compile(r"^[A-Za-z&. ]*\bBANK(?:\s+(?:LTD|LIMITED))?\.?$", flags=re.IGNORECASE)
+REFUND_RE = re.compile(r"(?<![A-Za-z])(?:REFUNDS?|RFND|REVERSAL)(?![A-Za-z])", flags=re.IGNORECASE)
+BANK_WORD_RE = re.compile(r"\bBANK\b", flags=re.IGNORECASE)
+# Level 5: purposes only one direction can have.
+DEBIT_ONLY_LEVEL5 = frozenset({"credit card", "loan repayment"})
+CREDIT_NARRATION_PURPOSE_OK_RE = re.compile(r"\brepay(?:ment|ments|ed)?\b", flags=re.IGNORECASE)
+# (pattern, direction, Level 5, Level 3 used when Level 3 is blank or p2p, extra condition)
+LEVEL5_FINAL_RULES: tuple[tuple[re.Pattern, str, str, str, re.Pattern | None], ...] = (
+    (
+        re.compile(r"(?<![A-Za-z])CC(?![A-Za-z]).{0,40}?AUTO[\s-]?PAY", flags=re.IGNORECASE),
+        "debit",
+        "credit card",
+        "institution",
+        None,
+    ),
+    (DIV_KEYWORD_RE, "credit", "dividend", "institution", ACH_CR_DIV_RE),
+    (re.compile(r"^\s*DRP/.*\bUN\s*LOAD\b", flags=re.IGNORECASE), "any", "wallet unload", "", None),
+    (re.compile(r"^\s*DRP/.*\bLOAD\b", flags=re.IGNORECASE), "any", "wallet load", "", None),
+)
+# Level 4: a label whose alias collides with an ordinary word ("cred" inside "credit", "credi",
+# "credited") is kept only when that alias stands alone as a token. Add a label here to protect it.
+LEVEL4_COLLISION_LABELS = frozenset({"cred"})
+# A platform named in the text wins over a bank or a blank: label -> its text aliases.
+LEVEL4_TEXT_PLATFORM_ALIASES: dict[str, tuple[str, ...]] = {"paytm": ("one97", "one97 communications")}
+# A digit-bearing word standing alone (ONE97), never part of a UPI id ("VIVEN82@OKHDFCBANK",
+# "ZOMATO4.PAYU@ICICI") or a longer reference.
+BRAND_DIGIT_TOKEN_RE = re.compile(r"(?<![A-Za-z0-9@.])([A-Za-z]{2,})(\d{1,4})(?=\s+[A-Za-z]|\s*[/|]|$)")
+
+
+def restore_digit_brand_tokens(level6: str, particulars: str) -> str:
+    """Put the digits back in a brand token the name lost them in (one -> one97)."""
+
+    name = str(level6 or "")
+    if not name:
+        return name
+    for match in BRAND_DIGIT_TOKEN_RE.finditer(str(particulars or "")):
+        base, full = match.group(1).lower(), match.group(0).lower()
+        if re.search(rf"(?<![a-z0-9]){base}(?![a-z0-9])", name):
+            name = re.sub(rf"(?<![a-z0-9]){base}(?![a-z0-9])", full, name, count=1)
+    return name
+
+
+def apply_final_level_rules(
+    particulars: str,
+    result: dict[str, str],
+    debit_value: object = None,
+    credit_value: object = None,
+    master_locked: bool = False,
+) -> dict[str, str]:
+    """Settle Level 1 to Level 5 with the tables above. Master matches keep their names."""
+
+    text = str(particulars or "")
+    core = LEVEL1_TRAILING_CHQ_RE.sub("", text).strip()
+    direction = derive_direction_from_amounts(debit_value, credit_value)
+    is_credit, is_debit = direction == "credit", direction == "debit"
+
+    # 1. Bounced cheque: nothing but the instrument is known.
+    if REJECT_RE.match(core):
+        result.update(BOUNCED_CHEQUE_LEVELS)
+        return result
+
+    # 2. Level 1.
+    result["Level_1"] = decide_level1(text, result.get("Level_1", ""))
+
+    # 3. ATM cash rows: no counterparty, purpose or payee; Level 4 keeps the bank when named.
+    if is_debit and result["Level_1"] == "cash" and ATM_WITHDRAWAL_RE.search(core):
+        result["Level_3"] = result["Level_5"] = result["Level_6"] = ""
+        if not result.get("Level_4"):
+            result["Level_4"] = detect_level_4_platform_or_bank(core)
+
+    # 4. Level 3.
+    if not master_locked:
+        payee_match = P2M_PAYEE_RE.search(core)
+        payee_text = BANK_LEGAL_NAME_RE.sub(" ", core)
+        if payee_match and BANK_PAYEE_RE.match(payee_match.group(1).strip()):
+            result["Level_3"], result["Level_5"] = "institution", ""
+        elif result.get("Level_3") == "p2p" and is_company_name(payee_text):
+            is_body = bool(BANK_WORD_RE.search(payee_text) or GOVERNMENT_PAYEE_RE.search(core))
+            result["Level_3"] = "institution" if is_body else "merchant"
+            if result.get("Level_5") == "p2p transfer":
+                result["Level_5"] = ""
+        if is_credit and REFUND_RE.search(core):
+            result["Level_5"] = ""
+
+    # 5. Level 5.
+    if not master_locked:
+        for pattern, rule_direction, purpose, level_3, condition in LEVEL5_FINAL_RULES:
+            if rule_direction == "debit" and not is_debit:
+                continue
+            if rule_direction == "credit" and not is_credit:
+                continue
+            if pattern.search(core) and (condition is None or condition.search(core)):
+                result["Level_5"] = purpose
+                if level_3 and result.get("Level_3", "") in {"", "p2p"}:
+                    result["Level_3"] = level_3
+                break
+    if is_credit:
+        purpose = _normalize_compare(result.get("Level_5", ""))
+        if purpose == "credit card":
+            result["Level_5"] = "p2p transfer" if result.get("Level_3") == "p2p" else ""
+        elif purpose in DEBIT_ONLY_LEVEL5 and not CREDIT_NARRATION_PURPOSE_OK_RE.search(core):
+            result["Level_5"] = ""
+
+    # 6. Level 4: whole-token platforms; a platform in the text beats a bank.
+    level_4 = _normalize_compare(result.get("Level_4", ""))
+    if level_4 in LEVEL4_COLLISION_LABELS and not master_locked:
+        lowered = core.lower()
+        named = any(_contains_alias(lowered, alias) for alias in PLATFORM_ALIASES[level_4])
+        if not named and detect_level_4_platform_or_bank(core) != level_4:
+            result["Level_4"] = detect_level_4_platform_or_bank(core)
+    for label, aliases in LEVEL4_TEXT_PLATFORM_ALIASES.items():
+        if any(_contains_alias(core.lower(), alias) for alias in aliases):
+            result["Level_4"] = label
+            break
+
+    # 7. Digits inside a brand token stay.
+    if result.get("Level_6"):
+        result["Level_6"] = restore_digit_brand_tokens(result["Level_6"], core)
+    return result
+
+
+def apply_final_level_rules_df(df: pd.DataFrame, locked_rows: set | None = None) -> pd.DataFrame:
+    """Re-run the final rules on a classified frame (entity merging can undo a row's labels)."""
+
+    needed = {"Particulars", "Level_1", "Level_3", "Level_4", "Level_5", "Level_6"}
+    if not needed.issubset(df.columns):
+        return df
+    output_df = df.copy()
+    locked = locked_rows or set()
+    debit = output_df["Debit"] if "Debit" in output_df.columns else pd.Series(None, index=output_df.index)
+    credit = output_df["Credit"] if "Credit" in output_df.columns else pd.Series(None, index=output_df.index)
+    columns = [c for c in ("Level_1", "Level_2", "Level_3", "Level_4", "Level_5", "Level_6", "Level_7") if c in output_df.columns]
+    for index in output_df.index:
+        row = {c: ("" if pd.isna(output_df.at[index, c]) else str(output_df.at[index, c])) for c in columns}
+        before = dict(row)
+        after = apply_final_level_rules(output_df.at[index, "Particulars"], row, debit[index], credit[index], index in locked)
+        for column in columns:
+            if after.get(column, before[column]) != before[column]:
+                output_df.at[index, column] = after[column]
+    return output_df
+
+
+
 class BankStatementClassifier:
     """Classify full bank statement rows by aggregating split keyword predictions."""
 
@@ -4022,6 +4279,13 @@ class BankStatementClassifier:
                 output_df.loc[row_index, "Credit"],
                 [part_text for part_text, _ in row_parts],
             )
+            row_prediction = apply_final_level_rules(
+                str(output_df.loc[row_index, "Particulars"]),
+                row_prediction,
+                output_df.loc[row_index, "Debit"],
+                output_df.loc[row_index, "Credit"],
+                master_locked,
+            )
             row_prediction, layout_named = apply_layout_level6_override(
                 str(output_df.loc[row_index, "Particulars"]), row_prediction, master_locked
             )
@@ -4058,6 +4322,7 @@ class BankStatementClassifier:
         output_df = apply_cheque_return_level1(output_df)
         output_df = apply_canonical_level6(output_df, named_rows)
         output_df = apply_entity_level3(output_df, named_rows, locked_rows)
+        output_df = apply_final_level_rules_df(output_df, locked_rows)
         output_df["First Level Classification"] = output_df.apply(
             derive_first_level_classification,
             axis=1,
@@ -4072,5 +4337,6 @@ class BankStatementClassifier:
         output_df = detect_salary(output_df)
         output_df = apply_strict_level2(output_df)
         output_df = apply_level7_recurrence(output_df)
+        output_df = apply_final_level_rules_df(output_df, locked_rows)
         logger.info("Classified %s statement rows", len(output_df))
         return output_df

@@ -18,6 +18,7 @@ if __package__ in {None, ""}:
     sys.path.append(str(Path(__file__).resolve().parent.parent))
     from src.prompt_part3 import (
         PromptArtifacts,
+        BANK_LEGAL_NAME_RE,
         clean_entity,
         detect_counterparty_marker,
         detect_explicit_purpose,
@@ -27,14 +28,17 @@ if __package__ in {None, ""}:
         detect_platform_or_bank,
         empty_result,
         format_prompt_tsv,
+        is_company_name,
         is_rail_platform_only_keyword,
         looks_like_business_name,
         looks_like_person_name,
+        normalize_spaces,
     )
     from src.rule_engine import RuleEngine
 else:
     from .prompt_part3 import (
         PromptArtifacts,
+        BANK_LEGAL_NAME_RE,
         clean_entity,
         detect_counterparty_marker,
         detect_explicit_purpose,
@@ -44,9 +48,11 @@ else:
         detect_platform_or_bank,
         empty_result,
         format_prompt_tsv,
+        is_company_name,
         is_rail_platform_only_keyword,
         looks_like_business_name,
         looks_like_person_name,
+        normalize_spaces,
     )
     from .rule_engine import RuleEngine
 
@@ -312,6 +318,10 @@ class KeywordClassifier:
                 metadata["decision_source"] = metadata["decision_source"] or "counterparty_marker"
 
         compact = cleaned.replace(" ", "")
+        # The preprocessor may drop digits ("ONE97" -> "one"); a brand token with a digit in
+        # it is matched on the digit-keeping form of the raw keyword as well.
+        raw_cleaned = normalize_spaces(raw_keyword)
+        raw_compact = raw_cleaned.replace(" ", "")
         if not manual_merchant:
             for alias, payload in sorted(
                 self.artifacts.merchant_aliases.items(),
@@ -320,7 +330,11 @@ class KeywordClassifier:
             ):
                 # Aliases of 5 letters or fewer must equal a token ("solar" must not fire
                 # inside "solarcare"); longer aliases keep the substring match.
-                if alias in compact and (len(alias) > 5 or alias_in_keyword(alias, cleaned)):
+                if (alias in compact or alias in raw_compact) and (
+                    len(alias) > 5
+                    or alias_in_keyword(alias, cleaned)
+                    or alias_in_keyword(alias, raw_cleaned)
+                ):
                     result.update({key: value for key, value in payload.items() if value})
                     if payload.get("Level_3"):
                         self._set_level3(
@@ -342,6 +356,18 @@ class KeywordClassifier:
                         )
                     metadata["decision_source"] = metadata["decision_source"] or "merchant_alias"
                     break
+
+        # A company-form word (PVT LTD, LLP, TECHNOLOGIES, SERVICES ...) names a business on
+        # every rail: merchant, or institution when it is a bank's own legal name.
+        if not result["Level_3"] and is_company_name(raw_keyword):
+            self._set_level3(
+                result,
+                metadata,
+                "institution" if BANK_LEGAL_NAME_RE.search(raw_keyword) else "merchant",
+                "company_name_rule",
+                0.9,
+            )
+            metadata["decision_source"] = metadata["decision_source"] or "company_name_rule"
 
         if not result["Level_3"]:
             p2p_entity = detect_p2p_entity(raw_keyword, self.artifacts.merchant_aliases)
