@@ -24,6 +24,25 @@ import matplotlib.pyplot as plt
 logger = logging.getLogger(__name__)
 
 DEFAULT_WINDOW_DAYS = 10
+# Several salary credits on one day are one pay day: one window, salary = their total. Set False to keep
+# one event per credit (their windows are then identical, so summing events double counts spending).
+SALARY_EVENT_MERGE_SAME_DAY = True
+# Microsegmentation decides the window category first, so every sheet tells the same story.
+SEGMENT_WINDOW_TAG = {
+    "Own Account Transfer": "transfer",  # money moved between the holder's own accounts or wallets
+    "P2P Transfer": "transfer",
+}
+# Used only when no narration rule decided: debt service, tax, charges and fees are money spent.
+SEGMENT_WINDOW_FALLBACK = {
+    "Loan": "expenditure", "EMI": "expenditure", "Credit Card Payment": "expenditure", "Tax": "expenditure",
+    "Penalty / Charges": "expenditure", "Education": "expenditure",
+}
+# Columns shown on the Salary Window Transactions sheet (the full row stays on the Classified sheet).
+WINDOW_TRANSACTION_COLUMNS = (
+    "Salary_Event_Id", "Salary_Date", "Window_End_Date", "Days_After_Salary", "Salary_Amount",
+    "Date", "Particulars", "Debit", "First Level Classification", "Second Level Classification",
+    "Level_3", "Level_5", "Level_6", "Microsegmentation", "Window_Category", "Classified_Amount",
+)
 SAVINGS_FLAG_COLUMNS = ("exp_saving", "exp_investment")
 EXPENDITURE_FLAG_COLUMNS = (
     "exp_food",
@@ -473,13 +492,15 @@ def _window_tag(row: pd.Series) -> str:
 
     if _is_failed(row):
         return ""
+    if SEGMENT_WINDOW_TAG.get(_text(row, "MicroSegment") or _text(row, "Microsegmentation")) == "transfer":
+        return "transfer"
     if _savings_match(row):
         return "savings"
     if _expenditure_match(row):
         return "expenditure"
     if _transfer_match(row):
         return "transfer"
-    return ""
+    return SEGMENT_WINDOW_FALLBACK.get(_text(row, "MicroSegment") or _text(row, "Microsegmentation"), "")
 
 
 def _is_savings(row: pd.Series) -> int:
@@ -569,9 +590,16 @@ def _analyze_one_group(
     working_df["debit_num"] = working_df["Debit"].apply(parse_amount)
     working_df["credit_num"] = working_df["Credit"].apply(parse_amount)
     window_tags = working_df.apply(_window_tag, axis=1)
+    # A debit with no confident purpose stays visible as unclassified instead of being forced into a bucket.
+    failed = working_df.apply(_is_failed, axis=1)
+    window_tags = window_tags.mask(window_tags.eq("") & working_df["debit_num"].gt(0) & ~failed, "unclassified")
+    working_df["Window_Category"] = window_tags.map(
+        {"savings": "Savings", "expenditure": "Expenditure", "transfer": "Transfer", "unclassified": "Unclassified"}
+    ).fillna("")
     working_df["Is_Savings"] = window_tags.eq("savings").astype(int)
     working_df["Is_Expenditure"] = window_tags.eq("expenditure").astype(int)
     working_df["Is_Transfer"] = window_tags.eq("transfer").astype(int)
+    working_df["Is_Unclassified"] = window_tags.eq("unclassified").astype(int)
 
     is_salary_series = working_df.get("IsSalary", pd.Series(0, index=working_df.index))
     salary_df = working_df[
@@ -589,7 +617,17 @@ def _analyze_one_group(
 
     salary_records = list(salary_df.iterrows())
     salary_days = sorted({record["_date"].normalize() for _, record in salary_records})
-    for event_number, (salary_index, salary_row) in enumerate(salary_records, start=1):
+    if SALARY_EVENT_MERGE_SAME_DAY:
+        by_day: dict[pd.Timestamp, list] = {}
+        for record in salary_records:
+            by_day.setdefault(record[1]["_date"].normalize(), []).append(record)
+        pay_days = [by_day[day] for day in sorted(by_day)]
+    else:
+        pay_days = [[record] for record in salary_records]
+    for event_number, pay_day in enumerate(pay_days, start=1):
+        salary_index, salary_row = pay_day[0]
+        salary_total = float(sum(record["credit_num"] for _, record in pay_day))
+        salary_entities = list(dict.fromkeys(str(r.get("Level_6", "")) for _, r in pay_day if str(r.get("Level_6", ""))))
         salary_date = salary_row["_date"].normalize()
         natural_window_end = salary_date + pd.Timedelta(days=window_days - 1)
         # The next LATER salary date caps the window (events on the same day share one window),
@@ -609,7 +647,7 @@ def _analyze_one_group(
         window_df["Salary_Event_Id"] = event_number
         window_df["Salary_Date"] = salary_date
         window_df["Window_End_Date"] = window_end
-        window_df["Salary_Amount"] = float(salary_row["credit_num"])
+        window_df["Salary_Amount"] = salary_total
         window_df["Days_After_Salary"] = (
             window_df["_date"].dt.normalize().sub(salary_date).dt.days.astype(int)
         )
@@ -626,27 +664,33 @@ def _analyze_one_group(
         savings_amount = float(window_df["Savings_Debit"].sum())
         expenditure_amount = float(window_df["Expenditure_Debit"].sum())
         transfer_amount = float(window_df["Transfer_Debit"].sum())
+        window_df["Unclassified_Debit"] = window_df["debit_num"] * window_df["Is_Unclassified"].astype(int)
+        window_df["Classified_Amount"] = window_df["debit_num"].where(window_df["Window_Category"].ne(""), 0.0)
+        unclassified_amount = float(window_df["Unclassified_Debit"].sum())
 
         event_row = {
             **group_values,
             "Salary_Event_Id": event_number,
             "Salary_Date": salary_date,
             "Window_End_Date": window_end,
-            "Window_Days": window_days,
-            "Salary_Amount": float(salary_row["credit_num"]),
+            # Effective length: a window cut short by the next pay day reports the days it really covers.
+            "Window_Days": int((window_end - salary_date).days) + 1,
+            "Salary_Amount": salary_total,
             "Savings_Transactions": int(window_df["Is_Savings"].sum()),
             "Expenditure_Transactions": int(window_df["Is_Expenditure"].sum()),
             "Transfer_Transactions": int(window_df["Is_Transfer"].sum()),
             "Savings_Amount": round(savings_amount, 2),
             "Expenditure_Amount": round(expenditure_amount, 2),
             "Transfer_Amount": round(transfer_amount, 2),
+            "Unclassified_Transactions": int(window_df["Is_Unclassified"].sum()),
+            "Unclassified_Amount": round(unclassified_amount, 2),
             # Savings vs spending only; transfers are not in the ratio.
             "Savings_to_Expenditure_Ratio": round(savings_amount / expenditure_amount, 4)
             if expenditure_amount
             else 0.0,
-            "Salary_Confidence": salary_row.get("SalaryConfidence", 0.0),
-            "Salary_Entity": salary_row.get("Level_6", ""),
-            "Salary_Particulars": salary_row.get("Particulars", ""),
+            "Salary_Confidence": min(float(r.get("SalaryConfidence", 0.0) or 0.0) for _, r in pay_day),
+            "Salary_Entity": "; ".join(salary_entities),
+            "Salary_Particulars": " | ".join(str(r.get("Particulars", "")) for _, r in pay_day),
         }
         event_rows.append(event_row)
 
@@ -686,8 +730,13 @@ def build_salary_time_series(
     df: pd.DataFrame,
     window_days: int = DEFAULT_WINDOW_DAYS,
     group_columns: tuple[str, ...] | None = None,
+    detailed: bool = False,
 ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-    """Return salary-window summary, transactions, and daily-curve tables."""
+    """Return salary-window summary, transactions, and daily-curve tables.
+
+    The transactions table keeps the business columns (WINDOW_TRANSACTION_COLUMNS); pass detailed=True
+    for every classified column and flag as well.
+    """
 
     if window_days <= 0:
         raise ValueError("window_days must be a positive integer.")
@@ -738,6 +787,12 @@ def build_salary_time_series(
         "Built salary time-series analytics for %s salary events",
         len(salary_events_df),
     )
+    if not detailed and not window_transactions_df.empty:
+        window_transactions_df = window_transactions_df.copy()
+        if "Microsegmentation" not in window_transactions_df.columns and "MicroSegment" in window_transactions_df.columns:
+            window_transactions_df["Microsegmentation"] = window_transactions_df["MicroSegment"]
+        keep = [*(group_columns or ()), *WINDOW_TRANSACTION_COLUMNS]
+        window_transactions_df = window_transactions_df[[c for c in keep if c in window_transactions_df.columns]]
     return (
         salary_events_df.reset_index(drop=True),
         window_transactions_df.reset_index(drop=True),

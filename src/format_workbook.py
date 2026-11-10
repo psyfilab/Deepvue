@@ -63,13 +63,13 @@ EMPTY_SALARY_SHEETS = {
     "Salary Window Summary": ["Salary_Event_Id", "Salary_Date", "Window_End_Date", "Window_Days", "Salary_Amount",
                               "Savings_Transactions", "Expenditure_Transactions", "Transfer_Transactions",
                               "Savings_Amount", "Expenditure_Amount", "Transfer_Amount",
+                              "Unclassified_Transactions", "Unclassified_Amount",
                               "Savings_to_Expenditure_Ratio", "Salary_Confidence", "Salary_Entity",
                               "Salary_Particulars"],
     "Salary Window Transactions": ["Salary_Event_Id", "Salary_Date", "Window_End_Date", "Days_After_Salary",
-                                   "Salary_Amount", "Is_Savings", "Is_Expenditure", "Is_Transfer", "Savings_Debit",
-                                   "Expenditure_Debit", "Transfer_Debit", "Sl. No.", "Date", "Particulars", "Debit",
-                                   "Credit", "Balance", "Ref/Chq No.", "First Level Classification",
-                                   "Second Level Classification", "Microsegmentation"],
+                                   "Salary_Amount", "Date", "Particulars", "Debit", "First Level Classification",
+                                   "Second Level Classification", "Level_3", "Level_5", "Level_6",
+                                   "Microsegmentation", "Window_Category", "Classified_Amount"],
 }
 HIDDEN_COLUMNS = ("debit_num", "credit_num", "IsSalaryTxn")  # working columns, never shown
 CLASSIFIED_COLUMNS = (
@@ -384,6 +384,15 @@ def build_dictionary(workbook, flag_pairs: list[tuple[str, str]]) -> None:
     section("Scores")
     for item, meaning in SCORE_MEANINGS:
         line(item, meaning)
+    section("Salary windows (Salary Window Summary and Salary Window Transactions sheets)")
+    line("Window", "From the pay day to the day before the next pay day, at most 10 days. Window_Days is the effective "
+                   "length, so a window cut short by the next pay day shows fewer than 10. Credits on the same day "
+                   "are one pay day: salary is their total.")
+    line("Window_Category", "Savings (SIP, FD, RD, mutual fund, PPF, NPS, investment platform), Expenditure (spending, bills, "
+                            "loans, tax, charges), Transfer (to other people, or between the holder's own accounts and wallets), "
+                            "Unclassified (a debit whose purpose could not be decided; shown, never forced into a bucket). "
+                            "Failed or reversed rows are left out.")
+    line("Classified_Amount", "The debit counted in the row's Window_Category.")
     section("Microsegmentation values")
     line("Rule", "Level 5 always decides first. Keywords are read only when Level 5 is blank (or generic), in the payee "
                  "name only, as whole words; a UPI handle, bank name, reference or purpose tail never triggers a flag.")
